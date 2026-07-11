@@ -1,79 +1,38 @@
 # Implementation Plan: Remote DSpark Speculative Decoder
 
-## Objective
-Implement the system described in `handoff.md`:
-1. Patched `llama-server` with `draft-remote-dspark` speculative mode.
-2. Edge drafter daemon `llama-dspark-grpcd`.
-3. Edge preview CLI (`--watch`).
-4. gRPC protocol, build scripts, and tests.
+## Status: implemented
 
-## Repository Layout
+This repository now contains the Linux implementation described in `handoff.md`.
 
-```
-.
-├── handoff.md              # Source spec
-├── PLAN.md                 # This file
-├── README.md               # User-facing overview
-├── .gitignore
-├── .gitmodules             # llama.cpp submodule
-├── CMakeLists.txt          # Top-level orchestration
-├── proto/
-│   └── dspark.proto        # gRPC service definition
-├── third_party/
-│   └── llama.cpp/          # git submodule (pinned)
-├── patches/
-│   ├── 0001-dspark-pr.patch # DSpark PR #25173 diff (placeholder)
-│   └── 0002-remote-dspark.patch # Our server-side patch
-├── tools/
-│   └── llama-dspark-grpcd/ # Edge daemon
-│       ├── CMakeLists.txt
-│       ├── main.cpp
-│       ├── grpc_service.cpp
-│       ├── grpc_service.h
-│       ├── dspark_engine.cpp
-│       ├── dspark_engine.h
-│       ├── watch_renderer.cpp
-│       ├── watch_renderer.h
-│       └── replay_mode.cpp
-├── server_patches/
-│   ├── remote_dspark_client.h
-│   ├── remote_dspark_client.cpp
-│   └── server_integration.cpp
-├── scripts/
-│   ├── init.sh             # Clone submodule + apply patches
-│   ├── build.sh            # Build server + daemon
-│   └── run_demo.sh         # Localhost two-process demo
-├── tests/
-│   ├── test_proto.py
-│   ├── test_daemon_replay.py
-│   └── fake_drafter.cpp
-└── models/
-    └── README.md           # Where to place GGUFs
-```
+## What was delivered
 
-## Work Items
+- `llama.cpp` submodule pinned to DSpark PR #25173 (`27cc3bae`).
+- gRPC protocol (`proto/dspark.proto`) with `InitSession`, `Prefill`, `Draft`, `Reset`.
+- Edge daemon `llama-dspark-grpcd`:
+  - Loads a DSpark GGUF.
+  - Serves the gRPC protocol.
+  - Injects per-token tap-layer features into the local draft KV cache.
+  - Runs DSpark anchor-first block drafting.
+  - `--watch` live speculation preview renderer.
+  - `--replay` golden-trace replay mode.
+- Server-side patches (`server_patches/`):
+  - `dspark_drafter.h` / `remote_dspark_client.cpp` — gRPC client abstraction.
+  - `remote_dspark_impl.h` — server-side remote DSpark speculative impl.
+  - `apply_remote_dspark.py` — patches `llama.cpp` in place.
+- Build/orchestration scripts (`scripts/init.sh`, `scripts/build.sh`, `scripts/run_demo.sh`).
+- Tests: Python proto round-trip tests and fake remote drafter.
+- Documentation: `README.md`, `models/README.md`.
 
-- [ ] Add `llama.cpp` submodule pinned to a known DSpark-compatible commit.
-- [ ] Create gRPC protocol (`proto/dspark.proto`).
-- [ ] Implement edge daemon core:
-  - [ ] GGUF loading / metadata handshake.
-  - [ ] Prefill feature injection.
-  - [ ] Draft block generation using lifted DSpark logic.
-  - [ ] Reset and session management.
-  - [ ] Replay mode for golden traces.
-- [ ] Implement edge preview renderer (`--watch`).
-- [ ] Implement server-side `draft-remote-dspark` integration:
-  - [ ] gRPC client wrapper.
-  - [ ] Speculative backend registration.
-  - [ ] Feature extraction / packing.
-  - [ ] Fallback path on edge failure.
-- [ ] Provide fake remote drafter for Milestone 5.
-- [ ] Build scripts and CMake orchestration.
-- [ ] Add unit/smoke tests.
-- [ ] Update README with usage.
+## Verified
 
-## Constraints
-- Linux only for this phase (QNX deferred).
-- Server KV cache never leaves the server.
-- Edge device only receives tap-layer hidden states.
-- Greedy decoding for the POC; non-greedy deferred.
+- `cmake --build build --target llama-dspark-grpcd llama-server` succeeds.
+- `llama-server --help` lists `--spec-draft-remote-grpc` and `--spec-type draft-remote-dspark`.
+- `llama-dspark-grpcd --help` runs.
+- `tests/test_proto.py` passes.
+
+## Next steps (not in this phase)
+
+- Milestone 1: convert Qwen3-4B + DSpark checkpoint and run local `draft-dspark`.
+- Milestone 3: instrument local path to dump golden feature packets.
+- Milestone 6: end-to-end localhost/Pi run with real models.
+- Phase 2: QNX port.
