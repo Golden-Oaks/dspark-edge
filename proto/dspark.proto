@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package dspark;
+
+// DSpark remote drafter service.
+// The server (llama.cpp) owns the target model and KV cache.
+// The edge daemon owns the DSpark draft model and its local draft KV cache.
+// Only tap-layer hidden states cross the wire.
+service DSparkDraftService {
+  // One-time handshake. The server tells the drafter what target/tokenizer
+  // it is using; the drafter replies with the feature shape it needs.
+  rpc InitSession(InitSessionRequest) returns (InitSessionResponse);
+
+  // Chunked prompt prefill. The server sends hidden states for every prompt
+  // token; the drafter injects them into its local draft KV cache.
+  rpc Prefill(PrefillRequest) returns (PrefillResponse);
+
+  // One call per target decode step. The server sends the tokens accepted
+  // since the last Draft call, with their hidden states. The drafter truncates
+  // stale draft state, injects the accepted tokens, and returns a new draft
+  // block.
+  rpc Draft(DraftRequest) returns (DraftResponse);
+
+  // Reset a session (e.g. on cancellation or end of generation).
+  rpc Reset(ResetRequest) returns (ResetResponse);
+}
+
+message InitSessionRequest {
+  string target_model_id = 1;  // e.g. "Qwen/Qwen3-4B"
+  string tokenizer_hash = 2; // e.g. sha256 of tokenizer.json
+}
+
+// The drafter tells the server what it needs. The server configures its
+// hidden-state extraction from this — it never loads the draft GGUF.
+message InitSessionResponse {
+  uint64 session_id = 1;
+  bool ok = 2;
+  string message = 3;
+
+  string draft_model_id = 4;        // e.g. "deepseek-ai/dspark_qwen3_4b_block7"
+  repeated uint32 target_layer_ids = 5; // [1, 9, 17, 25, 33] for Qwen3-4B
+  uint32 hidden_size = 6;             // target hidden size (e.g. 2560)
+  uint32 block_size = 7;                // trained block size (e.g. 7)
+  string feature_dtype = 8;             // "bf16" for the POC; "q8" later
+}
+
+// Per-token target hidden-state packet.
+// `features` layout: hidden states for target_layer_ids, concatenated in
+// that order, hidden_size values each, packed as feature_dtype.
+// For bf16: 5 * 2560 * 2 = 25,600 bytes per token for the Qwen3-4B checkpoint.
+message TokenFeatures {
+  int32 token = 1;       // token id
+  uint64 position = 2;   // position in the target sequence
+  bytes features = 3;    // packed hidden states
+}
+
+// Sent in chunks after the server finishes target prefill, before the first
+// Draft call.
+message PrefillRequest {
+  uint64 session_id = 1;
+  repeated TokenFeatures tokens = 2;
+  bool last_chunk = 3;
+}
+
+message PrefillResponse {
+  bool ok = 1;
+  uint64 n_positions = 2; // drafter KV fill level, for sanity checks
+}
+
+// One call per target decode step.
+message DraftRequest {
+  uint64 session_id = 1;
+  uint64 step_id = 2;
+
+  // Tokens accepted by the server since the previous Draft call.
+  // May be empty if the server rejected the entire previous draft block and
+  // produced a single correction token.
+  repeated TokenFeatures accepted_tokens = 3;
+
+  // The drafter must truncate its local draft KV cache beyond this position
+  // before injecting accepted_tokens.
+  uint64 position = 4;
+
+  uint32 max_draft_tokens = 5;
+  bool greedy = 6; // POC assumes greedy; non-greedy deferred
+}
+
+message DraftResponse {
+  uint64 session_id = 1;
+  uint64 step_id = 2;
+
+  repeated int32 draft_tokens = 3;   // proposed draft token IDs
+  repeated float draft_logprobs = 4; // log-prob of each drafted token
+  // Per-position predicted acceptance from the DSpark confidence head,
+  // available when the checkpoint has dspark_conf_proj.
+  repeated float confidence = 5;
+
+  uint32 draft_us = 6;  // edge draft latency in microseconds
+  bool ok = 7;
+  string error = 8;
+}
+
+message ResetRequest {
+  uint64 session_id = 1;
+}
+
+message ResetResponse {
+  bool ok = 1;
+}
