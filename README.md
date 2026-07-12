@@ -1,4 +1,4 @@
-# dspark-edging
+# dspark-edge
 
 Remote DSpark speculative decoding over gRPC for llama.cpp.
 
