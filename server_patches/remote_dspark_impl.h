@@ -273,6 +273,13 @@ struct common_speculative_impl_draft_remote_dspark : public common_speculative_i
     }
 
     bool need_embd() const override {
-        return true;
+        // The tap-layer hidden states this drafter streams to the edge come from
+        // the embeddings_layer_inp capture (extract_layer_inputs), which runs for
+        // every ubatch token regardless of per-token output flags. Returning true
+        // here would make the server flag every prompt token as an output
+        // (slot.need_embd()), overflowing the output buffer the server sizes to
+        // n_parallel * (1 + n_draft_max): any prompt chunk longer than that trips
+        // GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max) in output_reserve.
+        return false;
     }
 };
