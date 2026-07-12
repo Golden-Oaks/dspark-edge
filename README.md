@@ -45,6 +45,81 @@ git submodule update --init
 MODELS_DIR=models ./scripts/run_demo.sh
 ```
 
+## QNX edge device (Raspberry Pi 5)
+
+The edge daemon (`llama-dspark-grpcd`) runs on QNX 8.0 (`aarch64le`). Only the
+daemon is built there — `llama-server` stays on the Linux host. The daemon *is*
+a llama.cpp application: it runs the DSpark draft model locally, so it links
+`libggml` + `libllama` + `llama-common`. For the Qwen3 (`dflash`) draft, which
+omits the token-embedding matrix and output head to stay small (~630 MB), the
+daemon also loads the Qwen3-4B target GGUF purely to borrow those two shared
+tensors (`--target-model`).
+
+### Live demo — companion CLI drafting on the Pi
+
+Captured over SSH from the QNX Raspberry Pi 5 in real time: the edge daemon's
+`--watch` companion preview rendering live speculative decoding while this
+machine (x86-64 Linux) serves the Qwen3-4B target over gRPC. The ~80 s model
+load is fast-forwarded 10× (marked on screen); the drafting is real-time.
+
+[![DSpark companion CLI drafting live on the QNX Raspberry Pi 5](docs/media/dspark-pi-companion-cli.png)](docs/media/dspark-pi-companion-cli.mp4)
+
+In the `--watch` transcript, **gray italic** is the block the Pi just drafted
+(pending), **red strikethrough** is a draft token the target rejected, and plain
+text is confirmed output. The prompt `"The capital of France is"` streams
+token-by-token — each block drafted on-device, verified on the host — while the
+interleaved `[dspark-engine] inject_decode` lines are the daemon's real per-block
+draft calls. (Video: [`docs/media/dspark-pi-companion-cli.mp4`](docs/media/dspark-pi-companion-cli.mp4).)
+
+Build natively on the target:
+
+```sh
+# On the QNX Pi (aarch64le), from a checkout of this repo:
+scripts/qnx/install_deps.sh     # apk: protobuf/abseil/c-ares/re2/openssl/zlib, cmake, ninja
+scripts/qnx/build_grpc.sh       # gRPC 1.65 (qnx-ports fork) -> $HOME/work/grpc-install
+scripts/qnx/build_daemon.sh     # llama-dspark-grpcd (build-qnx/)
+```
+
+gRPC is not an apk package on QNX, so `build_grpc.sh` compiles the
+[qnx-ports/grpc](https://github.com/qnx-ports/grpc) fork (`qnx-v1.65.0`)
+natively against apk-provided OpenSSL, bundling its own protobuf/abseil/re2 for
+version consistency. The llama.cpp QNX source fixes (arch detection for
+`aarch64le`, a syspage-based memory query, a `getcwd` backend-search path, and
+`<limits.h>` includes) mirror the official
+[qnx-ports llama.cpp port](https://github.com/qnx-ports/build-files/pull/290)
+and live in `patches/qnx_llamacpp.patch` (applied by `scripts/init.sh`).
+
+Run the daemon (client) on the Pi and the server on the host:
+
+```sh
+# Pi (edge / draft):
+LD_LIBRARY_PATH=$HOME/work/grpc-install/lib \
+  build-qnx/tools/llama-dspark-grpcd/llama-dspark-grpcd \
+    --model    models/dspark_qwen3_4b_block7.gguf \
+    --target-model models/Qwen3-4B-Q8_0.gguf \
+    --host 0.0.0.0 --port 50051
+
+# Host (server / target):
+build/bin/llama-server -m models/Qwen3-4B-Q8_0.gguf \
+    --spec-type draft-remote-dspark \
+    --spec-draft-remote-grpc <pi-ip>:50051 \
+    --spec-draft-n-max 4 \
+    --host 127.0.0.1 --port 8080 --ctx-size 512 --n-gpu-layers 0 --flash-attn off
+```
+
+Keep `--spec-draft-n-max` below the draft's `block_size` (7): a verify batch of
+`n_max + 1` outputs must fit `cparams.n_outputs_max`, and `n_max == block_size`
+trips that bound.
+
+**Confirmed end-to-end** (2026-07-12) on QNX 8.0 / Raspberry Pi 5 (`aarch64le`,
+8 GB) as the edge client with an x86-64 Linux host as the target: prompt
+`"The capital of France is"` → `" Paris."`, drafts served by the Pi over gRPC
+(`/debug/spec` reports `edge_host 10.0.0.189:50051`, draft acceptance ≈ 0.33,
+`avg_edge_draft_ms ≈ 323`, `avg_grpc_ms ≈ 337`). The daemon builds with
+`GGML_CPU_REPACK=OFF` because it loads the full Q8 target (for its shared
+embedding/output tensors) alongside the draft, and the repack path's extra
+weight copy would exceed 8 GB.
+
 ## Milestones
 
 | Milestone | Status | Notes |
@@ -85,6 +160,7 @@ Unary gRPC service defined in `proto/dspark.proto`:
 
 ## Notes
 
-- Linux only for this phase. QNX is Phase 2.
+- The server runs on Linux; the edge daemon runs on Linux or QNX 8.0 (see the
+  QNX section above).
 - Greedy decoding for the POC; correct non-greedy sampling needs full draft distributions.
 - See `handoff.md` for the full specification.

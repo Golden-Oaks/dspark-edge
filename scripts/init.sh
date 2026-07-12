@@ -20,4 +20,11 @@ cd ../..
 
 python3 server_patches/apply_remote_dspark.py
 
+# QNX portability fixes for llama.cpp (aarch64le arch detection, syspage memory
+# query, getcwd backend-search path, <limits.h> includes). Mirrors the official
+# qnx-ports llama.cpp port (github.com/qnx-ports/build-files PR #290). Harmless
+# on Linux (all hunks are __QNX__-guarded or cross-platform). --forward makes
+# re-runs a no-op.
+patch -p1 -d third_party/llama.cpp --forward --fuzz=3 < patches/qnx_llamacpp.patch || true
+
 echo "Initialized and patched llama.cpp."

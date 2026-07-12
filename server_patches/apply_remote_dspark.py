@@ -365,6 +365,50 @@ def patch_server_cmake():
     report("tools/server/CMakeLists.txt", True)
 
 
+def patch_server_ctx_tgt():
+    """Wire up ctx_tgt for the remote DSpark drafter.
+
+    The remote drafter has no local draft model, so the target-context handoff
+    that the draft/MTP path does must also happen for it: (1) treat a configured
+    remote_grpc endpoint as "has spec", and (2) set draft.ctx_tgt before the
+    draft-model-loading block (which the remote path skips)."""
+    path = os.path.join(LLAMA, "tools", "server", "server-context.cpp")
+    s = read(path)
+
+    if "has_remote_dspark" not in s:
+        s = s.replace(
+            "        const bool has_spec = has_draft || spec_mtp;\n",
+            "        const bool has_remote_dspark = !params_base.speculative.draft.remote_grpc.empty();\n"
+            "        const bool has_spec = has_draft || spec_mtp || has_remote_dspark;\n",
+            1,
+        )
+
+    # Set ctx_tgt before, and guard, the draft-model-loading block.
+    marker = ("            {\n"
+              "                common_params params_dft = common_base_params_to_speculative(params_base);\n")
+    if marker in s:
+        s = s.replace(
+            marker,
+            "            params_base.speculative.draft.ctx_tgt = ctx_tgt;\n\n"
+            "            // A local draft model (draft/MTP) needs loading here; the remote\n"
+            "            // DSpark drafter has no local draft model, so it only needs ctx_tgt\n"
+            "            // (set above) and skips this block.\n"
+            "            if (has_draft || spec_mtp) {\n"
+            "                common_params params_dft = common_base_params_to_speculative(params_base);\n",
+            1,
+        )
+        # Drop the now-duplicate assignment that lived inside the block.
+        s = s.replace(
+            "                params_base.speculative.draft.ctx_tgt = ctx_tgt;\n"
+            "                params_base.speculative.draft.ctx_dft = ctx_dft;\n",
+            "                params_base.speculative.draft.ctx_dft = ctx_dft;\n",
+            1,
+        )
+
+    write(path, s)
+    report("tools/server/server-context.cpp (ctx_tgt)", True)
+
+
 def main():
     if not os.path.isdir(LLAMA):
         print(f"error: {LLAMA} not found; run git submodule update --init first")
@@ -378,6 +422,7 @@ def main():
     patch_server_schema()
     patch_server_cmake()
     patch_debug_spec_endpoint()
+    patch_server_ctx_tgt()
     print("done.")
 
 
