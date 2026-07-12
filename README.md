@@ -7,6 +7,30 @@ The server runs the full target LLM and owns the KV cache. The edge device
 lightweight DSpark draft model. Per-token target hidden states from 5 tap layers
 cross the wire; the target KV cache never leaves the server.
 
+## How the data flows
+
+A live decode of **Gemma 4 12B-it** (the target) with
+`dspark_gemma4_12b_block7` as the speculative-decoder draft model. The animation
+tracks one round trip per draft block:
+
+[![DSpark remote speculative-decoding data flow, live Gemma 4 12B decode](docs/media/dspark-dataflow.png)](docs/media/dspark-dataflow.mp4)
+
+- **Server → edge (top wire):** for every accepted token the server emits its
+  target hidden states — 5 tap layers, `bf16` — and streams them to the edge.
+  This is *all* that leaves the server; the target KV cache stays put.
+- **Edge → server (bottom wire):** the edge injects those hidden states into its
+  local draft KV cache, runs the DSpark draft model, and sends a **draft block**
+  of speculative tokens (with logprobs) back for the server to verify.
+- **Between them (companion-CLI transcript):** the block the edge just drafted is
+  shown **gray italic** while pending; when the server verifies it against the
+  target, accepted tokens flash **green** and settle into the output, and the
+  first token the target rejects is struck through in **red** before the target's
+  correction is appended. It mirrors the on-device `--watch` view below.
+
+The clip is rendered from `docs/media/render_dataflow.py` (Python + Pillow →
+frames → `ffmpeg`); the decode it plays is `"The capital of France is"` →
+`" Paris, a city famous for its art, fashion, and cuisine."`.
+
 ## Supported model families
 
 | Family | Draft GGUF arch | Target | Draft |
