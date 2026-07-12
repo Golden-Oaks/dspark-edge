@@ -25,32 +25,13 @@ else()
     find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin REQUIRED)
 endif()
 
-set(PROTO_DIR ${CMAKE_SOURCE_DIR}/proto)
-set(PROTO_FILE ${PROTO_DIR}/dspark.proto)
-set(GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
-file(MAKE_DIRECTORY ${GENERATED_DIR})
-
-add_custom_command(
-    OUTPUT
-        ${GENERATED_DIR}/dspark.pb.cc
-        ${GENERATED_DIR}/dspark.pb.h
-        ${GENERATED_DIR}/dspark.grpc.pb.cc
-        ${GENERATED_DIR}/dspark.grpc.pb.h
-    COMMAND ${Protobuf_PROTOC_EXECUTABLE}
-        --grpc_out=${GENERATED_DIR}
-        --cpp_out=${GENERATED_DIR}
-        --proto_path=${PROTO_DIR}
-        --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
-        ${PROTO_FILE}
-    DEPENDS ${PROTO_FILE}
-)
-
-add_library(dspark_proto STATIC
-    ${GENERATED_DIR}/dspark.pb.cc
-    ${GENERATED_DIR}/dspark.grpc.pb.cc
-)
-target_include_directories(dspark_proto PUBLIC ${GENERATED_DIR})
-target_link_libraries(dspark_proto PUBLIC ${PROTOBUF_LIB} ${GRPC_GRPCPP})
+# The generated dspark.pb.cc / dspark.grpc.pb.cc are compiled into llama-common
+# (server_patches/apply_remote_dspark.py generates them into llama.cpp/common/).
+# The daemon must NOT compile its own copy: when llama-common is a shared
+# library (the llama.cpp default), both copies' global initializers run and
+# protobuf aborts at startup with "File already exists in database:
+# dspark.proto". Link llama-common's objects instead; the headers are on the
+# llama-common public include path.
 
 add_executable(${TARGET}
     main.cpp
@@ -70,9 +51,9 @@ target_include_directories(${TARGET} PRIVATE
 )
 
 target_link_libraries(${TARGET} PRIVATE
-    dspark_proto
     llama-common
     llama
+    ${PROTOBUF_LIB}
     ${GRPC_GRPCPP}
 )
 
