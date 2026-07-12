@@ -7,6 +7,22 @@ The server runs the full target LLM and owns the KV cache. The edge device
 lightweight DSpark draft model. Per-token target hidden states from 5 tap layers
 cross the wire; the target KV cache never leaves the server.
 
+## Supported model families
+
+| Family | Draft GGUF arch | Target | Draft |
+|--------|-----------------|--------|-------|
+| Qwen3-4B | `dflash` | `Qwen3-4B` | `dspark_qwen3_4b_block7` |
+| Gemma 4 12B | `dspark` | `gemma-4-12B-it` | `dspark_gemma4_12b_block7` |
+
+The Gemma4 DSpark draft is a distinct `dspark` architecture (Gemma4 backbone:
+scaled embeddings, `k_eq_v` attention, attention scale 1.0, post-attention and
+post-FFW norms, GELU FFN, proportional RoPE, and final-logit softcapping) with a
+fused Markov/confidence head. It is added to the pinned llama.cpp submodule via
+`patches/gemma_dspark_llamacpp.patch` (applied by `scripts/apply_gemma_dspark.sh`,
+which `scripts/init.sh` runs automatically). The Gemma4 *target* is served by
+llama.cpp's existing `gemma4` arch — no target-side changes are needed. Pinned
+artifacts and checksums are in `models.lock`.
+
 ## Components
 
 - `llama-server` — patched to support `--spec-type draft-remote-dspark`.

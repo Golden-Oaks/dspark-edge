@@ -161,6 +161,19 @@ def patch_speculative_cpp():
         if marker in s:
             s = s.replace("            " + marker, insert + marker)
 
+    # Accept the Gemma4 "dspark" arch's block-size key in the local draft-dspark
+    # path (the Qwen3 draft uses "dflash.block_size"; the Gemma draft uses
+    # "dspark.block_size"). Harmless for the remote path.
+    old_bs = (
+        '            if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {'
+    )
+    new_bs = (
+        '            if (llama_model_meta_val_str(model_dft, "dspark.block_size", buf, sizeof(buf)) >= 0 ||\n'
+        '                llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {'
+    )
+    if 'dspark.block_size' not in s and old_bs in s:
+        s = s.replace(old_bs, new_bs)
+
     write(path, s)
     report("common/speculative.cpp", True)
 
