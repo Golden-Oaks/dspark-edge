@@ -1,0 +1,820 @@
+diff --git a/conversion/__init__.py b/conversion/__init__.py
+index 8c72359..7cd1fd6 100644
+--- a/conversion/__init__.py
++++ b/conversion/__init__.py
+@@ -83,6 +83,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
+     "Gemma4AssistantForCausalLM": "gemma",
+     "Gemma4ForConditionalGeneration": "gemma",
+     "Gemma4ForCausalLM": "gemma",
++    "Gemma4DSparkModel": "gemma",
+     "Gemma4UnifiedForConditionalGeneration": "gemma",
+     "Gemma4UnifiedAssistantForCausalLM": "gemma",
+     "GemmaForCausalLM": "gemma",
+diff --git a/conversion/gemma.py b/conversion/gemma.py
+index c552df7..e5a859a 100644
+--- a/conversion/gemma.py
++++ b/conversion/gemma.py
+@@ -765,6 +765,79 @@ class Gemma4Model(Gemma3Model):
+         yield from super().modify_tensors(data_torch, name, bid)
+ 
+ 
++@ModelBase.register("Gemma4DSparkModel")
++class Gemma4DSparkModel(Gemma4Model):
++    # DSpark = a Gemma4-backbone block-diffusion draft model with a Markov &
++    # Confidence head. Emits arch "dspark" (distinct from the Qwen3 "dflash" path).
++    model_arch = gguf.MODEL_ARCH.DSPARK
++
++    def set_vocab(self):
++        if self.target_model_dir is None:
++            raise ValueError(
++                "DSpark draft model requires --target-model-dir to be specified. "
++                "Please provide the path to the target model directory containing the tokenizer."
++            )
++        logger.info(f"DSpark: Using tokenizer from target model: {self.target_model_dir}")
++        original_dir = self.dir_model
++        self.dir_model = self.target_model_dir
++        super().set_vocab()
++        self.dir_model = original_dir
++
++        mask_token_id = self.hparams.get("mask_token_id")
++        if mask_token_id is not None:
++            self.gguf_writer.add_mask_token_id(mask_token_id)
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++
++        block_size = self.hparams.get("block_size", 7)
++        self.gguf_writer.add_block_size(block_size)
++
++        target_layer_ids = self.hparams.get("target_layer_ids", [])
++        if target_layer_ids:
++            # map 0-based decoder-output indices to layer-input indices
++            extract_layer_ids = [i + 1 for i in target_layer_ids]
++            self.gguf_writer.add_target_layers(extract_layer_ids)
++
++        # DSpark attention is fully bidirectional
++        self.gguf_writer.add_causal_attention(False)
++
++        markov_rank = int(self.hparams.get("markov_rank", 0))
++        self.gguf_writer.add_markov_rank(markov_rank)
++        if markov_rank > 0:
++            markov_head_type = self.hparams.get("markov_head_type")
++            if markov_head_type != "vanilla":
++                raise ValueError(
++                    f"Unsupported markov_head_type: {markov_head_type!r}. Only 'vanilla' is supported."
++                )
++            self.gguf_writer.add_markov_head_type(markov_head_type)
++
++        enable_confidence_head = bool(self.hparams.get("enable_confidence_head", False))
++        self.gguf_writer.add_enable_confidence_head(enable_confidence_head)
++        if enable_confidence_head:
++            self.gguf_writer.add_confidence_head_with_markov(
++                bool(self.hparams.get("confidence_head_with_markov", False))
++            )
++
++    @classmethod
++    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
++        name, gen = item
++        if not name.startswith("model."):
++            name = "model." + name
++        # k_eq_v=true: the checkpoint ships no separate V projection / V norm.
++        if ".v_proj." in name or name.endswith(".v_norm.weight"):
++            logger.debug(f"Skipping tensor {name!r} (k_eq_v=true, no v_proj/v_norm).")
++            return None
++        return super().filter_tensors((name, gen))
++
++    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        # draft dir has no tokenizer; embed is copied from target and already vocab-aligned
++        if "embed_tokens.weight" in name:
++            yield from TextModel.modify_tensors(self, data_torch, name, bid)
++            return
++        yield from super().modify_tensors(data_torch, name, bid)
++
++
+ @ModelBase.register("Gemma4UnifiedForConditionalGeneration")
+ class Gemma4UnifiedModel(Gemma4Model):
+     model_arch = gguf.MODEL_ARCH.GEMMA4
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 2357f8b..1d5b0da 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -158,6 +158,10 @@ class Keys:
+         TARGET_LAYERS                     = "{arch}.target_layers"
+         TARGET_HIDDEN_SIZE                = "{arch}.target_hidden_size"
+         BLOCK_SIZE                        = "{arch}.block_size"
++        MARKOV_RANK                       = "{arch}.markov_rank"
++        MARKOV_HEAD_TYPE                  = "{arch}.markov_head_type"
++        ENABLE_CONFIDENCE_HEAD            = "{arch}.enable_confidence_head"
++        CONFIDENCE_HEAD_WITH_MARKOV       = "{arch}.confidence_head_with_markov"
+         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
+ 
+     class Attention:
+@@ -530,6 +534,7 @@ class MODEL_ARCH(IntEnum):
+     MISTRAL3         = auto()
+     EAGLE3           = auto()
+     DFLASH           = auto()
++    DSPARK           = auto()
+     MISTRAL4         = auto()
+     PADDLEOCR        = auto()
+     MIMO2            = auto()
+@@ -953,10 +958,14 @@ class MODEL_TENSOR(IntEnum):
+     # eagle3
+     FC                     = auto()  # feature fusion layer
+     D2T                    = auto()  # draft to target vocabulary mapping
+-    # dspark
++    # dspark (Qwen3 backbone, arch "dflash")
+     DSPARK_MARKOV_W1       = auto()  # markov head: prev-token embed
+     DSPARK_MARKOV_W2       = auto()  # markov head: bias projection
+     DSPARK_CONF_PROJ       = auto()  # confidence head
++    # dspark (Gemma4 backbone, arch "dspark") — dotted tensor names
++    MARKOV_W1              = auto()  # markov head: prev-token embed
++    MARKOV_W2              = auto()  # markov head: bias projection
++    CONFIDENCE_PROJ        = auto()  # confidence head
+     # lfm2 audio
+     A_ENC_NORM_CONV        = auto()
+     A_ENC_LINEAR_POS       = auto()
+@@ -1114,6 +1123,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+     MODEL_ARCH.PANGU_EMBED:      "pangu-embedded",
+     MODEL_ARCH.MISTRAL3:         "mistral3",
+     MODEL_ARCH.EAGLE3:           "eagle3",
++    MODEL_ARCH.DSPARK:           "dspark",
+     MODEL_ARCH.DFLASH:           "dflash",
+     MODEL_ARCH.MISTRAL4:         "mistral4",
+     MODEL_ARCH.PADDLEOCR:        "paddleocr",
+@@ -1566,6 +1576,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+     MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
+     MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
+     MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
++    MODEL_TENSOR.MARKOV_W1:                 "markov.w1",
++    MODEL_TENSOR.MARKOV_W2:                 "markov.w2",
++    MODEL_TENSOR.CONFIDENCE_PROJ:           "confidence.proj",
+     MODEL_TENSOR.D2T:                       "d2t",
+ }
+ 
+@@ -4215,6 +4228,34 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.DSPARK_MARKOV_W2,
+         MODEL_TENSOR.DSPARK_CONF_PROJ,
+     ],
++    MODEL_ARCH.DSPARK: [
++        MODEL_TENSOR.TOKEN_EMBD,
++        MODEL_TENSOR.OUTPUT,
++        MODEL_TENSOR.OUTPUT_NORM,
++        MODEL_TENSOR.ROPE_FREQS,
++        MODEL_TENSOR.ATTN_NORM,
++        MODEL_TENSOR.ATTN_POST_NORM,
++        MODEL_TENSOR.ATTN_Q,
++        MODEL_TENSOR.ATTN_K,
++        MODEL_TENSOR.ATTN_OUT,
++        MODEL_TENSOR.ATTN_Q_NORM,
++        MODEL_TENSOR.ATTN_K_NORM,
++        # Gemma4 uses FFN_PRE_NORM (HF pre_feedforward_layernorm) which writes the
++        # same GGUF name "blk.N.ffn_norm"; this avoids the post_attention_layernorm
++        # alias collision that FFN_NORM would introduce.
++        MODEL_TENSOR.FFN_PRE_NORM,
++        MODEL_TENSOR.FFN_POST_NORM,
++        MODEL_TENSOR.FFN_GATE,
++        MODEL_TENSOR.FFN_DOWN,
++        MODEL_TENSOR.FFN_UP,
++        MODEL_TENSOR.LAYER_OUT_SCALE,
++        MODEL_TENSOR.FC,
++        MODEL_TENSOR.ENC_OUTPUT_NORM,
++        # DSpark heads (Gemma4, dotted names)
++        MODEL_TENSOR.MARKOV_W1,
++        MODEL_TENSOR.MARKOV_W2,
++        MODEL_TENSOR.CONFIDENCE_PROJ,
++    ],
+     MODEL_ARCH.MISTRAL4: [
+         MODEL_TENSOR.TOKEN_EMBD,
+         MODEL_TENSOR.OUTPUT_NORM,
+diff --git a/gguf-py/gguf/gguf_writer.py b/gguf-py/gguf/gguf_writer.py
+index 1e277f0..02811c2 100644
+--- a/gguf-py/gguf/gguf_writer.py
++++ b/gguf-py/gguf/gguf_writer.py
+@@ -952,6 +952,18 @@ class GGUFWriter:
+     def add_target_hidden_size(self, value: int) -> None:
+         self.add_uint32(Keys.LLM.TARGET_HIDDEN_SIZE.format(arch=self.arch), value)
+ 
++    def add_markov_rank(self, value: int) -> None:
++        self.add_uint32(Keys.LLM.MARKOV_RANK.format(arch=self.arch), value)
++
++    def add_markov_head_type(self, value: str) -> None:
++        self.add_string(Keys.LLM.MARKOV_HEAD_TYPE.format(arch=self.arch), value)
++
++    def add_enable_confidence_head(self, value: bool) -> None:
++        self.add_bool(Keys.LLM.ENABLE_CONFIDENCE_HEAD.format(arch=self.arch), value)
++
++    def add_confidence_head_with_markov(self, value: bool) -> None:
++        self.add_bool(Keys.LLM.CONFIDENCE_HEAD_WITH_MARKOV.format(arch=self.arch), value)
++
+     def add_norm_before_residual(self, value: bool) -> None:
+         self.add_bool(Keys.LLM.NORM_BEFORE_RESIDUAL.format(arch=self.arch), value)
+ 
+diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
+index 011dae8..f3d6671 100644
+--- a/gguf-py/gguf/tensor_mapping.py
++++ b/gguf-py/gguf/tensor_mapping.py
+@@ -1302,6 +1302,19 @@ class TensorNameMap:
+             "model.confidence_head.proj", # dspark
+         ),
+ 
++        # Gemma4 DSpark (arch "dspark") heads — same HF names, dotted GGUF names.
++        MODEL_TENSOR.MARKOV_W1: (
++            "model.markov_head.markov_w1", # dspark (gemma4)
++        ),
++
++        MODEL_TENSOR.MARKOV_W2: (
++            "model.markov_head.markov_w2", # dspark (gemma4)
++        ),
++
++        MODEL_TENSOR.CONFIDENCE_PROJ: (
++            "model.confidence_head.proj", # dspark (gemma4)
++        ),
++
+         MODEL_TENSOR.CLS: (
+             "classifier",       # jina
+             "classifier.dense", # roberta
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index bc53ee9..323bde1 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -131,6 +131,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_MISTRAL3,         "mistral3"         },
+     { LLM_ARCH_EAGLE3,           "eagle3"           },
+     { LLM_ARCH_DFLASH,           "dflash"           },
++    { LLM_ARCH_DSPARK,           "dspark"           },
+     { LLM_ARCH_MISTRAL4,         "mistral4"         },
+     { LLM_ARCH_PADDLEOCR,        "paddleocr"        },
+     { LLM_ARCH_MIMO2,            "mimo2"            },
+@@ -307,6 +308,11 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+ 
+     { LLM_KV_TARGET_LAYERS,         "%s.target_layers"        },
+     { LLM_KV_TARGET_HIDDEN_SIZE,    "%s.target_hidden_size"   },
++    { LLM_KV_BLOCK_SIZE,                     "%s.block_size"                     },
++    { LLM_KV_MARKOV_RANK,                    "%s.markov_rank"                    },
++    { LLM_KV_MARKOV_HEAD_TYPE,               "%s.markov_head_type"               },
++    { LLM_KV_ENABLE_CONFIDENCE_HEAD,         "%s.enable_confidence_head"         },
++    { LLM_KV_CONFIDENCE_HEAD_WITH_MARKOV,    "%s.confidence_head_with_markov"    },
+     { LLM_KV_NORM_BEFORE_RESIDUAL,  "%s.norm_before_residual" },
+ 
+     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
+@@ -606,6 +612,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_DSPARK_MARKOV_W1,                       "markov_w1" },
+     { LLM_TENSOR_DSPARK_MARKOV_W2,                       "markov_w2" },
+     { LLM_TENSOR_DSPARK_CONF_PROJ,                       "conf_proj" },
++    { LLM_TENSOR_MARKOV_W1,                              "markov.w1" },
++    { LLM_TENSOR_MARKOV_W2,                              "markov.w2" },
++    { LLM_TENSOR_CONFIDENCE_PROJ,                        "confidence.proj" },
+ };
+ 
+ // declare information about the model weight tensors:
+@@ -861,6 +870,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_DSPARK_MARKOV_W1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_DSPARK_MARKOV_W2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_DSPARK_CONF_PROJ,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_MARKOV_W1,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
++    {LLM_TENSOR_MARKOV_W2,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_CONFIDENCE_PROJ,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+ };
+ 
+ LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index ffe1fe9..810ee9f 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -145,6 +145,7 @@ enum llm_arch {
+     LLM_ARCH_MELLUM,
+     LLM_ARCH_EAGLE3,
+     LLM_ARCH_DFLASH,
++    LLM_ARCH_DSPARK,
+     LLM_ARCH_UNKNOWN,
+ };
+ 
+@@ -353,6 +354,11 @@ enum llm_kv {
+ 
+     LLM_KV_TARGET_LAYERS,
+     LLM_KV_TARGET_HIDDEN_SIZE,
++    LLM_KV_BLOCK_SIZE,
++    LLM_KV_MARKOV_RANK,
++    LLM_KV_MARKOV_HEAD_TYPE,
++    LLM_KV_ENABLE_CONFIDENCE_HEAD,
++    LLM_KV_CONFIDENCE_HEAD_WITH_MARKOV,
+     LLM_KV_NORM_BEFORE_RESIDUAL,
+ 
+     LLM_KV_SHORTCONV_L_CACHE,
+@@ -614,6 +620,11 @@ enum llm_tensor {
+     LLM_TENSOR_DSPARK_MARKOV_W1,
+     LLM_TENSOR_DSPARK_MARKOV_W2,
+     LLM_TENSOR_DSPARK_CONF_PROJ,
++    // Gemma4 DSpark (arch "dspark") stores these with dotted names, distinct from
++    // the Qwen3 dflash names above (markov_w1 / conf_proj).
++    LLM_TENSOR_MARKOV_W1,
++    LLM_TENSOR_MARKOV_W2,
++    LLM_TENSOR_CONFIDENCE_PROJ,
+ };
+ 
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 5edfc85..23b1b93 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -125,7 +125,7 @@ llama_context::llama_context(
+         cparams.ctx_other = params.ctx_other;
+     }
+ 
+-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
++    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_DSPARK) {
+         if (model.tok_embd == nullptr || model.output == nullptr) {
+             if (params.ctx_other == nullptr) {
+                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 8be5f28..65c9632 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -194,6 +194,13 @@ struct llama_hparams {
+     // e.g. the eagle3 encoder fuses target_layers * target_hidden features
+     uint32_t n_embd_inp_enc_impl = 0;
+ 
++    // DSpark (arch "dspark", Gemma4 backbone) speculative-draft parameters.
++    // Shared with the fused Markov/confidence head (see models/dspark.cpp).
++    uint32_t dspark_block_size          = 0;
++    uint32_t markov_rank                = 0;
++    bool     enable_confidence_head     = false;
++    bool     confidence_head_with_markov = false;
++
+     // output embedding dimension (0 = use n_embd)
+     uint32_t n_embd_out_impl = 0;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index adacf70..c984e64 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -296,6 +296,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_eagle3(params);
+         case LLM_ARCH_DFLASH:
+             return new llama_model_dflash(params);
++        case LLM_ARCH_DSPARK:
++            return new llama_model_dspark(params);
+         case LLM_ARCH_MIMO2:
+             return new llama_model_mimo2(params);
+         case LLM_ARCH_KIMI_LINEAR:
+@@ -2542,6 +2544,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_TALKIE:
+         case LLM_ARCH_MELLUM:
+         case LLM_ARCH_DFLASH:
++        case LLM_ARCH_DSPARK:
+             return LLAMA_ROPE_TYPE_NEOX;
+ 
+         case LLM_ARCH_QWEN2VL:
+@@ -2670,7 +2673,8 @@ bool llama_model_has_encoder(const llama_model * model) {
+         case LLM_ARCH_T5:
+         case LLM_ARCH_T5ENCODER:
+         case LLM_ARCH_EAGLE3:
+-        case LLM_ARCH_DFLASH:    return true;
++        case LLM_ARCH_DFLASH:
++        case LLM_ARCH_DSPARK:    return true;
+         default:                 return false;
+     }
+ }
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index 6afb6a8..9a31424 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -122,7 +122,7 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
+ }
+ 
+ // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
+-static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
++void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, int64_t block_size) {
+     ggml_context * ctx0 = g.ctx0;
+     auto         & res  = g.res;
+ 
+@@ -134,10 +134,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+     const int64_t n_vocab = base->ne[0];
+     const int64_t n_tok   = base->ne[1];
+ 
+-    const auto it = model.gguf_kv.find("dflash.block_size");
+-    GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires 'dflash.block_size' in GGUF metadata");
+-    const int64_t block_size = std::stoi(it->second);
+-    GGML_ASSERT(block_size > 0);
++    GGML_ASSERT(block_size > 0 && "DSpark draft requires a positive block size");
+ 
+     const int64_t n_blocks = g.ubatch.n_seqs_unq;
+     if (n_blocks == 0 || n_tok % n_blocks != 0) {
+@@ -386,6 +383,12 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+ 
+     // DSpark: bias the draft logits with the Markov head
+     if (model.dspark_markov_w1) {
+-        build_dspark_markov_head(*this, model, inp_tokens);
++        int64_t block_size = 0;
++        const auto it = model.gguf_kv.find("dflash.block_size");
++        if (it != model.gguf_kv.end()) {
++            block_size = std::stoi(it->second);
++        }
++        GGML_ASSERT(block_size > 0 && "DSpark draft requires 'dflash.block_size' in GGUF metadata");
++        build_dspark_markov_head(*this, model, inp_tokens, block_size);
+     }
+ }
+diff --git a/src/models/dspark.cpp b/src/models/dspark.cpp
+new file mode 100644
+index 0000000..6d12a33
+--- /dev/null
++++ b/src/models/dspark.cpp
+@@ -0,0 +1,362 @@
++#include "models.h"
++
++#include "llama-kv-cache.h"
++#include "llama-kv-cache-iswa.h"
++
++// DSpark (arch "dspark"): the Gemma4 backbone variant of the DFlash block-diffusion
++// draft model. Compared to dflash.cpp (Qwen3 backbone) the graph adds Gemma4-specific
++// behavior: scaled word embeddings, k_eq_v attention (V = K, no v_proj/v_norm),
++// attention scale 1.0, post-attention and post-FFW norms, per-layer output scale,
++// GELU FFN, proportional RoPE (per-layer rope_freqs), and final-logit softcapping.
++// The Markov & Confidence head is fused into the graph exactly as in dflash.cpp
++// (see build_dspark_markov_head), applied *after* the softcap.
++
++void llama_model_dspark::load_arch_hparams(llama_model_loader & ml) {
++    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
++    ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
++
++    // Gemma4 uses self.scaling = 1.0 (no pre-attention scaling)
++    hparams.f_attention_scale = 1.0f;
++
++    if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
++        throw std::runtime_error("DSpark model requires 'target_layers' in GGUF metadata");
++    }
++
++    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
++
++    LLAMA_LOG_INFO("%s: DSpark target_layers = [", __func__);
++    for (size_t i = 0; i < target_layer_ids.size(); ++i) {
++        LLAMA_LOG_INFO("%d%s", target_layer_ids[i], i + 1 < target_layer_ids.size() ? ", " : "");
++    }
++    LLAMA_LOG_INFO("]\n");
++
++    ml.get_key(LLM_KV_BLOCK_SIZE,  hparams.dspark_block_size, false);
++    ml.get_key(LLM_KV_MARKOV_RANK, hparams.markov_rank,       false);
++
++    if (hparams.markov_rank > 0) {
++        std::string markov_head_type;
++        if (!ml.get_key(LLM_KV_MARKOV_HEAD_TYPE, markov_head_type, false) || markov_head_type != "vanilla") {
++            throw std::runtime_error("DSpark only supports markov_head_type='vanilla'");
++        }
++    }
++
++    ml.get_key(LLM_KV_ENABLE_CONFIDENCE_HEAD,      hparams.enable_confidence_head,      false);
++    ml.get_key(LLM_KV_CONFIDENCE_HEAD_WITH_MARKOV, hparams.confidence_head_with_markov, false);
++
++    // optional interleaved sliding-window attention with a per-layer pattern.
++    // The released block-7 checkpoint has an all-false pattern, so this resolves to
++    // dense attention; the code path mirrors gemma4/dflash for forward compatibility.
++    if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
++        ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
++        if (hparams.is_swa_any()) {
++            hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
++            hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
++            hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
++        } else {
++            hparams.n_swa = 0;
++        }
++    }
++
++    type = LLM_TYPE_UNKNOWN;
++}
++
++void llama_model_dspark::load_arch_tensors(llama_model_loader &) {
++    LLAMA_LOAD_LOCALS;
++
++    const int64_t n_embd_inp = hparams.n_embd_inp_enc();
++
++    // The DSpark draft GGUF is self-contained: it ships its own token embeddings
++    // and output (lm_head) as separate quantized tensors.
++    tok_embd        = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,       "weight"), { n_embd, n_vocab }, 0);
++    output          = create_tensor(tn(LLM_TENSOR_OUTPUT,           "weight"), { n_embd, n_vocab }, 0);
++    fc              = create_tensor(tn(LLM_TENSOR_FC,               "weight"), { n_embd_inp, n_embd }, 0);
++    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM,  "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
++    output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,      "weight"), { n_embd }, 0); // decoder final norm
++
++    if (hparams.markov_rank > 0) {
++        dspark_markov_w1 = create_tensor(tn(LLM_TENSOR_MARKOV_W1, "weight"), { (int64_t) hparams.markov_rank, n_vocab }, 0);
++        dspark_markov_w2 = create_tensor(tn(LLM_TENSOR_MARKOV_W2, "weight"), { (int64_t) hparams.markov_rank, n_vocab }, 0);
++        LLAMA_LOG_INFO("%s: DSpark with markov head (rank = %u)\n", __func__, hparams.markov_rank);
++    }
++
++    if (hparams.enable_confidence_head) {
++        const int64_t conf_in = hparams.n_embd + (hparams.confidence_head_with_markov ? (int64_t) hparams.markov_rank : 0);
++        dspark_conf_proj   = create_tensor(tn(LLM_TENSOR_CONFIDENCE_PROJ, "weight"), { conf_in, 1 }, 0);
++        dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_CONFIDENCE_PROJ, "bias"),   { 1 }, 0);
++    }
++
++    int rope_freqs_flag = 0;
++
++    for (int i = 0; i < n_layer; ++i) {
++        auto & layer = layers[i];
++
++        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), { n_embd }, 0);
++        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
++
++        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k * n_head }, 0);
++        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa }, 0);
++        // k_eq_v: no v_proj tensor in the checkpoint, V is derived from K at runtime.
++        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, TENSOR_NOT_REQUIRED);
++        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
++
++        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
++        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
++
++        layer.ffn_norm      = create_tensor(tn(LLM_TENSOR_FFN_NORM,      "weight", i), { n_embd }, 0);
++        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), { n_embd }, 0);
++        layer.ffn_gate      = create_tensor(tn(LLM_TENSOR_FFN_GATE,      "weight", i), { n_embd, n_ff }, 0);
++        layer.ffn_down      = create_tensor(tn(LLM_TENSOR_FFN_DOWN,      "weight", i), { n_ff, n_embd }, 0);
++        layer.ffn_up        = create_tensor(tn(LLM_TENSOR_FFN_UP,        "weight", i), { n_embd, n_ff }, 0);
++
++        layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), { 1u }, TENSOR_NOT_REQUIRED);
++
++        if (!hparams.is_swa(i)) {
++            layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), { n_embd_head_k/2 }, rope_freqs_flag);
++            rope_freqs_flag = TENSOR_DUPLICATED;
++        }
++    }
++}
++
++std::unique_ptr<llm_graph_context> llama_model_dspark::build_arch_graph(const llm_graph_params & params) const {
++    switch (params.gtype) {
++        case LLM_GRAPH_TYPE_ENCODER:
++            return std::make_unique<graph<true>>(*this, params);
++        case LLM_GRAPH_TYPE_DEFAULT:
++        case LLM_GRAPH_TYPE_DECODER:
++            return std::make_unique<graph<false>>(*this, params);
++        default:
++            GGML_ABORT("invalid graph type");
++    };
++}
++
++template <>
++ggml_tensor * llama_model_dspark::graph<true>::build_inp_embd_enc() const {
++    auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
++
++    inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), n_tokens);
++    ggml_set_input(inp_target->embd);
++
++    ggml_tensor * cur = inp_target->embd;
++    cb(cur, "inp_embd", -1);
++
++    res->add_input(std::move(inp_target));
++
++    return cur;
++}
++
++// DSpark encoder: fuse the concatenated target-layer features through fc + norm.
++template <>
++llama_model_dspark::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
++    ggml_tensor * cur = build_inp_embd_enc();
++
++    cur = build_lora_mm(model.fc, cur);
++    cb(cur, "fc_out", -1);
++
++    cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
++    cb(cur, "enc_norm_out", -1);
++
++    ggml_set_output(cur);
++    res->t_h_nextn = cur;
++
++    ggml_build_forward_expand(gf, cur);
++}
++
++// DSpark decoder, dual-mode by batch type:
++//   * embd batch  -> fused target features: inject K/V into the draft cache (V = K).
++//   * token batch -> Gemma4 noise-block diffusion over [committed, MASK...] to draft tokens.
++template <>
++llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
++    const int64_t n_embd_head = hparams.n_embd_head_v();
++
++    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
++
++    ggml_tensor * inp_pos = build_inp_pos();
++
++    const bool use_iswa = hparams.swa_type != LLAMA_SWA_TYPE_NONE;
++
++    llm_graph_input_attn_kv      * inp_attn      = nullptr;
++    llm_graph_input_attn_kv_iswa * inp_attn_iswa = nullptr;
++    if (use_iswa) {
++        inp_attn_iswa = build_attn_inp_kv_iswa();
++    } else {
++        inp_attn = build_attn_inp_kv();
++    }
++
++    // Gemma4: attention scale is 1.0 (baked into f_attention_scale)
++    const float kq_scale = hparams.f_attention_scale;
++
++    // context K/V injection from fused target features (V = K)
++    if (ubatch.embd) {
++        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
++
++        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
++        ggml_set_input(inp->embd);
++
++        ggml_tensor * inp_g = inp->embd;
++        cb(inp_g, "inp_g_embeddings", -1);
++
++        res->add_input(std::move(inp));
++
++        for (int il = 0; il < n_layer; ++il) {
++            const auto & layer = model.layers[il];
++
++            const float freq_base_l  = model.get_rope_freq_base(cparams, il);
++            const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
++            const int   n_rot_l      = hparams.n_rot(il);
++
++            ggml_tensor * freq_factors = hparams.is_swa(il) ? nullptr : layer.rope_freqs;
++
++            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g);
++            ggml_tensor * Vcur = Kcur;
++
++            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
++            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
++
++            Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
++            Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
++
++            Kcur = ggml_rope_ext(
++                    ctx0, Kcur, inp_pos, freq_factors,
++                    n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
++                    ext_factor, attn_factor, beta_fast, beta_slow
++                    );
++            cb(Kcur, "Kcur_injected", il);
++            cb(Vcur, "Vcur_injected", il);
++
++            if (use_iswa) {
++                const bool    is_swa = hparams.is_swa(il);
++                const auto  * kv     = is_swa ? inp_attn_iswa->mctx->get_swa() : inp_attn_iswa->mctx->get_base();
++                ggml_tensor * k_idxs = is_swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs();
++                ggml_tensor * v_idxs = is_swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs();
++                ggml_build_forward_expand(gf, kv->cpy_k(ctx0, Kcur, k_idxs, il));
++                ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, v_idxs, il));
++            } else {
++                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
++                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
++            }
++        }
++
++        res->t_embd = inp_g;
++
++        ggml_build_forward_expand(gf, inp_g);
++        return;
++    }
++
++    GGML_ASSERT(model.tok_embd != nullptr && "DSpark decoder requires token_embd from the draft GGUF");
++    GGML_ASSERT(model.output   != nullptr && "DSpark decoder requires output (lm_head) from the draft GGUF");
++
++    auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
++
++    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++    ggml_set_input(inp->tokens);
++
++    ggml_tensor * inp_tokens = inp->tokens;
++
++    // Gemma4 scaled word embeddings: multiply by sqrt(hidden_size).
++    ggml_tensor * inpL = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
++    inpL = ggml_scale(ctx0, inpL, sqrtf(float(n_embd)));
++    cb(inpL, "inp_noise_embd", -1);
++
++    res->add_input(std::move(inp));
++
++    for (int il = 0; il < n_layer; ++il) {
++        const auto & layer = model.layers[il];
++
++        const float freq_base_l  = model.get_rope_freq_base(cparams, il);
++        const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
++        const int   n_rot_l      = hparams.n_rot(il);
++
++        ggml_tensor * freq_factors = hparams.is_swa(il) ? nullptr : layer.rope_freqs;
++
++        ggml_tensor * residual = inpL;
++
++        ggml_tensor * h = build_norm(inpL, layer.attn_norm, NULL, LLM_NORM_RMS, il);
++        cb(h, "attn_norm", il);
++
++        ggml_tensor * Qcur = build_lora_mm(layer.wq, h);
++        ggml_tensor * Kcur = build_lora_mm(layer.wk, h);
++        ggml_tensor * Vcur = Kcur; // k_eq_v
++
++        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
++        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
++        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
++
++        Qcur = build_norm(Qcur, layer.attn_q_norm, NULL, LLM_NORM_RMS, il);
++        Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
++        Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
++
++        Qcur = ggml_rope_ext(
++                ctx0, Qcur, inp_pos, freq_factors,
++                n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
++                ext_factor, attn_factor, beta_fast, beta_slow
++                );
++        Kcur = ggml_rope_ext(
++                ctx0, Kcur, inp_pos, freq_factors,
++                n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
++                ext_factor, attn_factor, beta_fast, beta_slow
++                );
++        cb(Qcur, "Qcur", il);
++        cb(Kcur, "Kcur", il);
++        cb(Vcur, "Vcur", il);
++
++        // cache-aware, non-causal attention (causality disabled by the driver)
++        ggml_tensor * cur = use_iswa
++            ? build_attn(inp_attn_iswa, layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
++            : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
++
++        cur = build_norm(cur, layer.attn_post_norm, NULL, LLM_NORM_RMS, il);
++        cb(cur, "attn_post_norm", il);
++
++        inpL = ggml_add(ctx0, cur, residual);
++        cb(inpL, "attn_out", il);
++
++        residual = inpL;
++
++        h = build_norm(inpL, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
++        cb(h, "ffn_norm", il);
++
++        cur = build_ffn(h,
++                layer.ffn_up,   NULL, NULL,
++                layer.ffn_gate, NULL, NULL,
++                layer.ffn_down, NULL, NULL,
++                NULL,
++                LLM_FFN_GELU, LLM_FFN_PAR, il);
++        cb(cur, "ffn_out", il);
++
++        cur = build_norm(cur, layer.ffn_post_norm, NULL, LLM_NORM_RMS, il);
++        cb(cur, "ffn_post_norm", il);
++
++        inpL = ggml_add(ctx0, cur, residual);
++        cb(inpL, "l_out", il);
++
++        if (layer.out_scale) {
++            inpL = ggml_mul(ctx0, inpL, layer.out_scale);
++            cb(inpL, "out_scaled", il);
++        }
++    }
++
++    ggml_tensor * cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1);
++    cb(cur, "result_norm", -1);
++
++    res->t_embd = cur;
++
++    cur = build_lora_mm(model.output, cur);
++    cb(cur, "result_output_pre_softcap", -1);
++
++    // Gemma4 final-logit softcapping: tanh(logits / c) * c, applied *before* the Markov bias.
++    if (hparams.f_final_logit_softcapping) {
++        cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
++        cur = ggml_tanh (ctx0, cur);
++        cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
++    }
++    cb(cur, "result_output", -1);
++    res->t_logits = cur;
++
++    ggml_build_forward_expand(gf, cur);
++
++    // DSpark: bias the softcapped draft logits with the fused Markov & Confidence head.
++    if (model.dspark_markov_w1) {
++        GGML_ASSERT(hparams.dspark_block_size > 0 && "DSpark draft requires 'dspark.block_size' in GGUF metadata");
++        build_dspark_markov_head(*this, model, inp_tokens, (int64_t) hparams.dspark_block_size);
++    }
++}
+diff --git a/src/models/models.h b/src/models/models.h
+index 7a52e7b..d98c50c 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1253,6 +1253,31 @@ struct llama_model_dflash : public llama_model_base {
+ };
+ 
+ 
++// DSpark = DFlash + Markov & Confidence head, biases the greedy draft logits per
++// block position. Shared by the Qwen3 (dflash) and Gemma4 (dspark) graphs.
++// `block_size` is the trained block size (dflash.block_size / dspark.block_size).
++void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, int64_t block_size);
++
++
++// Gemma4 DSpark draft (arch "dspark"): a DFlash-style encoder/decoder with the
++// Gemma4 backbone (scaled embeddings, k_eq_v attention, attn_scale=1.0,
++// post-attn/post-ffw norms, GELU FFN, proportional RoPE, logit softcap).
++struct llama_model_dspark : public llama_model_base {
++    llama_model_dspark(const struct llama_model_params & params) : llama_model_base(params) {}
++    void load_arch_hparams(llama_model_loader & ml) override;
++    void load_arch_tensors(llama_model_loader & ml) override;
++
++    template <bool is_enc>
++    struct graph : public llm_graph_context {
++        graph(const llama_model & model, const llm_graph_params & params);
++
++        ggml_tensor * build_inp_embd_enc() const;
++    };
++
++    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
++};
++
++
+ struct llama_model_mistral4 : public llama_model_deepseek2 {
+     llama_model_mistral4(const struct llama_model_params & params) : llama_model_deepseek2(params) {}
+     // reuse load_arch_hparams and load_arch_tensors from llama_model_deepseek2

@@ -13,6 +13,7 @@
 #include "dspark_engine.h"
 #include "grpc_service.h"
 #include "replay_mode.h"
+#include "selftest.h"
 #include "watch_renderer.h"
 
 using namespace dspark;
@@ -27,6 +28,7 @@ struct cmdline_args {
     int n_threads = 4;
     int n_ctx = 4096;
     bool watch = false;
+    bool selftest = false;
     std::string replay_dir;
 };
 
@@ -41,6 +43,7 @@ void print_usage(const char * prog) {
         "  --ctx-size N      context size (default: 4096)\n"
         "  --watch           render live speculation preview\n"
         "  --replay DIR      replay golden trace files and exit\n"
+        "  --selftest        drive the engine with synthetic features and exit\n"
         "  -h, --help        show this help\n",
         prog);
 }
@@ -63,6 +66,8 @@ cmdline_args parse_args(int argc, char ** argv) {
             args.n_ctx = std::atoi(argv[++i]);
         } else if (arg == "--watch") {
             args.watch = true;
+        } else if (arg == "--selftest") {
+            args.selftest = true;
         } else if (arg == "--replay" && i + 1 < argc) {
             args.replay_dir = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
@@ -151,6 +156,23 @@ int main(int argc, char ** argv) {
             return 1;
         }
         int rc = replay_golden(*engine, args.replay_dir);
+        llama_free(ctx_tgt);
+        llama_model_free(model_tgt);
+        llama_model_free(model);
+        return rc;
+    }
+
+    // Self-test mode: create a single engine, drive it with synthetic features, and exit.
+    if (args.selftest) {
+        auto engine = make_engine(model, ctx_tgt, args);
+        if (!engine || !engine->init()) {
+            LOG_ERR("[main] failed to initialize DSpark engine\n");
+            llama_free(ctx_tgt);
+            llama_model_free(model_tgt);
+            llama_model_free(model);
+            return 1;
+        }
+        int rc = run_selftest(*engine);
         llama_free(ctx_tgt);
         llama_model_free(model_tgt);
         llama_model_free(model);

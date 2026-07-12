@@ -60,7 +60,8 @@ bool dspark_engine::init() {
     cfg_.hidden_size = 0;
     {
         char buf[32] = {};
-        if (llama_model_meta_val_str(model_, "dflash.target_hidden_size", buf, sizeof(buf)) >= 0 ||
+        if (llama_model_meta_val_str(model_, "dspark.target_hidden_size", buf, sizeof(buf)) >= 0 ||
+            llama_model_meta_val_str(model_, "dflash.target_hidden_size", buf, sizeof(buf)) >= 0 ||
             llama_model_meta_val_str(model_, "target_hidden_size", buf, sizeof(buf)) >= 0) {
             cfg_.hidden_size = std::atoi(buf);
         }
@@ -71,10 +72,12 @@ bool dspark_engine::init() {
     }
 
     // Read block size from GGUF metadata.
+    // Qwen3 drafts use arch "dflash"; Gemma4 DSpark drafts use arch "dspark".
     cfg_.block_size = 16;
     {
         char buf[32] = {};
-        if (llama_model_meta_val_str(model_, "dflash.block_size", buf, sizeof(buf)) >= 0) {
+        if (llama_model_meta_val_str(model_, "dspark.block_size", buf, sizeof(buf)) >= 0 ||
+            llama_model_meta_val_str(model_, "dflash.block_size", buf, sizeof(buf)) >= 0) {
             cfg_.block_size = std::atoi(buf);
         }
     }

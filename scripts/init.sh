@@ -14,6 +14,10 @@ if [ "$(git rev-parse HEAD)" != "$PIN" ]; then
 fi
 cd ../..
 
+# Gemma4 DSpark ("dspark" arch) support (applied before the remote server patch;
+# the remote patch's speculative.cpp edits are string-based and stack on top).
+./scripts/apply_gemma_dspark.sh
+
 python3 server_patches/apply_remote_dspark.py
 
 echo "Initialized and patched llama.cpp."

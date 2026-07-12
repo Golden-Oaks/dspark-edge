@@ -58,6 +58,7 @@ add_executable(${TARGET}
     dspark_engine.cpp
     watch_renderer.cpp
     replay_mode.cpp
+    selftest.cpp
 )
 
 target_include_directories(${TARGET} PRIVATE
