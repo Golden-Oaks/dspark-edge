@@ -185,6 +185,10 @@ grpc::Status dspark_service_impl::Reset(
     {
         std::lock_guard<std::mutex> slock(it->second->mtx);
         it->second->engine->reset();
+        // The server restarts its step counter from 1 after a reset (new
+        // generation on a reused slot). Restart the session's replay guard too,
+        // or every post-reset Draft gets rejected as "stale step_id".
+        it->second->last_step_id = 0;
     }
     if (renderer_) renderer_->on_reset();
 
