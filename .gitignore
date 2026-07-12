@@ -7,3 +7,10 @@ __pycache__/
 *.pyc
 tests/dspark_pb2*.py
 .DS_Store
+
+# Model weights (large, downloaded/converted locally — see models/README.md)
+*.gguf
+models/*/
+
+# Generated golden traces (regenerate with LLAMA_DSPARK_GOLDEN_DIR)
+golden/*.pb

@@ -2,12 +2,48 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+
 #include "dspark.grpc.pb.h"
+#include "dspark_stats.h"
+#include "log.h"
+
+remote_dspark_stats & remote_dspark_stats_get() {
+    static remote_dspark_stats s;
+    return s;
+}
+
+namespace {
+// Golden-trace dump (Milestone 3). When LLAMA_DSPARK_GOLDEN_DIR is set, the
+// client serializes every Prefill / Draft request and Draft response into that
+// directory in the exact wire format the daemon's --replay mode consumes.
+const char * golden_dir() {
+    static const char * dir = std::getenv("LLAMA_DSPARK_GOLDEN_DIR");
+    return (dir && dir[0]) ? dir : nullptr;
+}
+
+void dump_message(const std::string & filename, const google::protobuf::Message & msg) {
+    const char * dir = golden_dir();
+    if (!dir) return;
+    std::string path = std::string(dir) + "/" + filename;
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        LOG_ERR("[remote-dspark-client] golden dump: cannot open %s\n", path.c_str());
+        return;
+    }
+    std::string buf;
+    msg.SerializeToString(&buf);
+    f.write(buf.data(), (std::streamsize)buf.size());
+}
+} // namespace
 
 struct grpc_dspark_drafter::impl {
     std::unique_ptr<dspark::DSparkDraftService::Stub> stub;
     uint64_t session_id = 0;
     bool initialized = false;
+    int prefill_chunk = 0;
 };
 
 grpc_dspark_drafter::grpc_dspark_drafter(const std::string & target)
@@ -32,11 +68,17 @@ bool grpc_dspark_drafter::init(const std::string & target_model_id,
     grpc::ClientContext ctx;
     grpc::Status status = pimpl->stub->InitSession(&ctx, req, &resp);
     if (!status.ok() || !resp.ok()) {
+        LOG_ERR("[remote-dspark-client] InitSession failed: status=%d msg='%s' resp.ok=%d resp.message='%s'\n",
+                (int)status.error_code(), status.error_message().c_str(), (int)resp.ok(), resp.message().c_str());
         return false;
     }
 
     pimpl->session_id = resp.session_id();
     pimpl->initialized = true;
+
+    // Record the handshake (feature dtype, tap layers, hidden/block size) so the
+    // golden trace is self-describing for replay (Milestone 3).
+    dump_message("session.pb", resp);
 
     out_target_layer_ids.clear();
     for (uint32_t lid : resp.target_layer_ids()) {
@@ -67,6 +109,10 @@ bool grpc_dspark_drafter::prefill(const std::vector<dspark_token_features> & tok
         pt->set_position(tf.position);
         pt->set_features(tf.features.data(), tf.features.size());
     }
+    char name[64];
+    std::snprintf(name, sizeof(name), "prefill_chunk_%03d.pb", pimpl->prefill_chunk++);
+    dump_message(name, grpc_req);
+
     dspark::PrefillResponse resp;
     grpc::ClientContext ctx;
     grpc::Status status = pimpl->stub->Prefill(&ctx, grpc_req, &resp);
@@ -80,7 +126,6 @@ bool grpc_dspark_drafter::reset() {
     dspark::ResetResponse resp;
     grpc::ClientContext ctx;
     grpc::Status status = pimpl->stub->Reset(&ctx, grpc_req, &resp);
-    pimpl->initialized = false;
     return status.ok() && resp.ok();
 }
 
@@ -97,6 +142,7 @@ remote_dspark_response grpc_dspark_drafter::draft(const remote_dspark_request & 
     grpc_req.set_position(req.position);
     grpc_req.set_max_draft_tokens(req.max_draft_tokens);
     grpc_req.set_greedy(req.greedy);
+    grpc_req.set_anchor_token(req.anchor_token);
 
     for (const auto & tf : req.accepted_tokens) {
         auto * pt = grpc_req.add_accepted_tokens();
@@ -108,6 +154,16 @@ remote_dspark_response grpc_dspark_drafter::draft(const remote_dspark_request & 
     dspark::DraftResponse grpc_resp;
     grpc::ClientContext ctx;
     grpc::Status status = pimpl->stub->Draft(&ctx, grpc_req, &grpc_resp);
+
+    if (golden_dir()) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "step_%04llu_request.pb",
+                      (unsigned long long)req.step_id);
+        dump_message(name, grpc_req);
+        std::snprintf(name, sizeof(name), "step_%04llu_response.pb",
+                      (unsigned long long)req.step_id);
+        dump_message(name, grpc_resp);
+    }
 
     res.session_id = grpc_resp.session_id();
     res.step_id    = grpc_resp.step_id();

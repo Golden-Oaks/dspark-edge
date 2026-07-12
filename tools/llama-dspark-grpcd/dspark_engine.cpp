@@ -108,7 +108,7 @@ bool dspark_engine::init() {
     sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
     smpl_ = common_sampler_init(model_, sparams);
 
-    if (!smpl_ || !batch_inject_.token || !batch_noise_.token) {
+    if (!smpl_ || !batch_inject_.embd || !batch_noise_.token) {
         return false;
     }
 
@@ -194,9 +194,13 @@ bool dspark_engine::inject_features(const std::vector<token_features> & tokens) 
             batch_inject_.logits[i]    = false;
         }
 
+        LOG_INF("[dspark-engine] inject_decode: n_tokens=%d pos_first=%d pos_last=%d embd=%p\n",
+                (int)n_chunk, (int)batch_inject_.pos[0], (int)batch_inject_.pos[n_chunk - 1],
+                (void*)batch_inject_.embd);
         rc = llama_decode(ctx_, batch_inject_);
         if (rc != 0) {
-            LOG_ERR("[dspark-engine] llama_decode(inject) failed rc=%d\n", rc);
+            LOG_ERR("[dspark-engine] llama_decode(inject) failed rc=%d n_tokens=%d pos_first=%d pos_last=%d\n",
+                    rc, (int)n_chunk, (int)batch_inject_.pos[0], (int)batch_inject_.pos[n_chunk - 1]);
             return false;
         }
     }
@@ -205,13 +209,18 @@ bool dspark_engine::inject_features(const std::vector<token_features> & tokens) 
 }
 
 bool dspark_engine::prefill(const std::vector<token_features> & tokens, uint64_t & n_positions) {
+    LOG_INF("[dspark-engine] prefill: n_tokens=%zu pos_first=%ld pos_last=%ld\n",
+            tokens.size(),
+            tokens.empty() ? -1L : (long)tokens.front().position,
+            tokens.empty() ? -1L : (long)tokens.back().position);
     if (!inject_features(tokens)) {
         n_positions = 0;
         return false;
     }
     n_positions = tokens.empty() ? 0 : tokens.back().position + 1;
     if (!tokens.empty()) {
-        last_token_id_ = (llama_token)tokens.back().token;
+        last_token_id_   = (llama_token)tokens.back().token;
+        kv_confirmed_max_ = (llama_pos)tokens.back().position;
     }
     return true;
 }
@@ -227,6 +236,7 @@ bool dspark_engine::reset() {
     last_draft_.clear();
     last_step_id_ = 0;
     last_token_id_ = 0;
+    kv_confirmed_max_ = -1;
     return true;
 }
 
@@ -237,12 +247,17 @@ draft_response dspark_engine::draft(const draft_request & req) {
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // 1. Truncate draft KV cache beyond the server's position.
+    // 1. Drop the transient noise block left in the draft KV cache by the previous
+    //    draft, keeping only the confirmed prefix [0 .. kv_confirmed_max_]. The KV
+    //    max position after this is exactly kv_confirmed_max_, so the accepted
+    //    tokens injected next continue consecutively (Y = X + 1).
+    //
+    //    We deliberately ignore req.position here: accepted-token positions are
+    //    authoritative and monotonic, so the daemon's own confirmed high-water mark
+    //    is a more reliable truncation point than the server's request position.
     {
         llama_memory_t mem = llama_get_memory(ctx_);
-        if (req.position < (uint64_t)llama_memory_seq_pos_max(mem, 0)) {
-            llama_memory_seq_rm(mem, 0, (llama_pos)req.position, -1);
-        }
+        llama_memory_seq_rm(mem, 0, kv_confirmed_max_ + 1, -1);
     }
 
     // 2. Inject accepted tokens (may be empty for a correction-only step).
@@ -251,13 +266,17 @@ draft_response dspark_engine::draft(const draft_request & req) {
         return res;
     }
 
-    // Track the last accepted token as the anchor for the next block.
+    // Advance the confirmed high-water mark.
     if (!req.accepted_tokens.empty()) {
-        last_token_id_ = (llama_token)req.accepted_tokens.back().token;
+        last_token_id_    = (llama_token)req.accepted_tokens.back().token;
+        kv_confirmed_max_ = (llama_pos)req.accepted_tokens.back().position;
     }
 
-    // 3. Run DSpark block draft.
-    res = run_draft(last_token_id_, req.max_draft_tokens, req.greedy);
+    // 3. Run DSpark block draft from the server-supplied anchor (id_last). The
+    //    anchor's own hidden state is intentionally not injected; the draft graph
+    //    consumes its token embedding at block position 0.
+    const llama_token anchor = req.anchor_token != 0 ? (llama_token)req.anchor_token : last_token_id_;
+    res = run_draft(anchor, req.max_draft_tokens, req.greedy);
 
     auto t1 = std::chrono::steady_clock::now();
     res.draft_us = (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();

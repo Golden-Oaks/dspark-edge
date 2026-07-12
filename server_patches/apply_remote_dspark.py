@@ -98,12 +98,14 @@ def patch_speculative_cpp():
             "        case COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE_DSPARK: return \"draft-remote-dspark\";",
         )
 
-    # static_assert count bump.
-    m = re.search(r"static_assert\(COMMON_SPECULATIVE_TYPE_COUNT == (\d+)\);", s)
-    if m:
-        old = m.group(0)
-        new = f"static_assert(COMMON_SPECULATIVE_TYPE_COUNT == {int(m.group(1)) + 1});"
-        s = s.replace(old, new, 1)
+    # static_assert count bump (idempotent: set to expected value after adding the enum).
+    if "COMMON_SPECULATIVE_TYPE_DRAFT_REMOTE_DSPARK" in s:
+        s = re.sub(
+            r"static_assert\(COMMON_SPECULATIVE_TYPE_COUNT == \d+\);",
+            "static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);",
+            s,
+            count=1,
+        )
 
     # init config: add has_draft_remote_dspark.
     if "has_draft_remote_dspark" not in s:
@@ -223,10 +225,82 @@ def generate_proto_to_common():
 def copy_drafter_files():
     dst_common = os.path.join(LLAMA, "common")
     shutil.copy(os.path.join(PATCH, "dspark_drafter.h"), dst_common)
+    shutil.copy(os.path.join(PATCH, "dspark_stats.h"), dst_common)
     shutil.copy(os.path.join(PATCH, "remote_dspark_client.cpp"), dst_common)
     shutil.copy(os.path.join(PATCH, "remote_dspark_impl.h"), dst_common)
     generate_proto_to_common()
-    print("copied dspark_drafter.h, remote_dspark_client.cpp, remote_dspark_impl.h to common/")
+    print("copied dspark_drafter.h, dspark_stats.h, remote_dspark_client.cpp, remote_dspark_impl.h to common/")
+
+
+def patch_debug_spec_endpoint():
+    # 1) add the handler member to server_routes
+    ctx_h = os.path.join(LLAMA, "tools", "server", "server-context.h")
+    s = read(ctx_h)
+    if "get_debug_spec" not in s:
+        s = s.replace(
+            "    server_http_context::handler_t get_metrics;",
+            "    server_http_context::handler_t get_metrics;\n"
+            "    server_http_context::handler_t get_debug_spec;",
+            1,
+        )
+        write(ctx_h, s)
+    report("tools/server/server-context.h", True)
+
+    # 2) add the include + handler body in init_routes
+    ctx_cpp = os.path.join(LLAMA, "tools", "server", "server-context.cpp")
+    s = read(ctx_cpp)
+    if '#include "dspark_stats.h"' not in s:
+        s = s.replace(
+            '#include "server-context.h"\n',
+            '#include "server-context.h"\n#include "dspark_stats.h"\n',
+            1,
+        )
+    if "this->get_debug_spec" not in s:
+        handler = (
+            "    this->get_debug_spec = [this](const server_http_req &) {\n"
+            "        auto res = create_response(true);\n"
+            "        const auto & st = remote_dspark_stats_get();\n"
+            "        const uint64_t blocks = st.draft_blocks.load();\n"
+            "        const uint64_t dtoks  = st.draft_tokens.load();\n"
+            "        const uint64_t atoks  = st.accepted_tokens.load();\n"
+            "        const uint64_t gcalls = st.grpc_calls.load();\n"
+            "        const double acc_rate = dtoks  ? (double) atoks / (double) dtoks : 0.0;\n"
+            "        const double edge_ms  = blocks ? (double) st.edge_draft_us_sum.load() / (double) blocks / 1000.0 : 0.0;\n"
+            "        const double grpc_ms  = gcalls ? (double) st.grpc_us_sum.load() / (double) gcalls / 1000.0 : 0.0;\n"
+            "        res->ok({\n"
+            '            { \"remote_dspark\",     st.connected.load() ? \"connected\" : \"disconnected\" },\n'
+            '            { \"edge_host\",         st.edge_host },\n'
+            '            { \"draft_blocks\",      blocks },\n'
+            '            { \"draft_tokens\",      dtoks },\n'
+            '            { \"accepted_tokens\",   atoks },\n'
+            '            { \"acceptance_rate\",   acc_rate },\n'
+            '            { \"avg_edge_draft_ms\", edge_ms },\n'
+            '            { \"avg_grpc_ms\",       grpc_ms },\n'
+            '            { \"fallback_steps\",    st.fallback_steps.load() },\n'
+            "        });\n"
+            "        return res;\n"
+            "    };\n\n"
+        )
+        s = s.replace(
+            "    this->get_metrics = [this](const server_http_req & req) {",
+            handler + "    this->get_metrics = [this](const server_http_req & req) {",
+            1,
+        )
+    write(ctx_cpp, s)
+    report("tools/server/server-context.cpp (debug/spec)", True)
+
+    # 3) register the route
+    srv = os.path.join(LLAMA, "tools", "server", "server.cpp")
+    s = read(srv)
+    if "/debug/spec" not in s:
+        s = s.replace(
+            '    ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));',
+            '    ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));\n'
+            '    ctx_http.get ("/debug/spec",               ex_wrapper(routes.get_debug_spec));',
+            1,
+        )
+    write(srv, s)
+    report("tools/server/server.cpp (debug/spec)", True)
 
 
 def patch_common_cmake():
@@ -290,6 +364,7 @@ def main():
     patch_common_cmake()
     patch_server_schema()
     patch_server_cmake()
+    patch_debug_spec_endpoint()
     print("done.")
 
 

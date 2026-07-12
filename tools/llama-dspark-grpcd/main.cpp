@@ -21,6 +21,7 @@ namespace {
 
 struct cmdline_args {
     std::string model_path;
+    std::string target_model_path;
     std::string host = "0.0.0.0";
     int port = 50051;
     int n_threads = 4;
@@ -33,6 +34,7 @@ void print_usage(const char * prog) {
     std::fprintf(stderr,
         "usage: %s [options]\n"
         "  --model PATH      DSpark GGUF model path (required)\n"
+        "  --target-model PATH  Target model GGUF path (required for DFlash arch)\n"
         "  --host HOST       gRPC bind host (default: 0.0.0.0)\n"
         "  --port PORT       gRPC bind port (default: 50051)\n"
         "  --threads N       number of threads (default: 4)\n"
@@ -49,6 +51,8 @@ cmdline_args parse_args(int argc, char ** argv) {
         std::string arg = argv[i];
         if ((arg == "--model" || arg == "-m") && i + 1 < argc) {
             args.model_path = argv[++i];
+        } else if (arg == "--target-model" && i + 1 < argc) {
+            args.target_model_path = argv[++i];
         } else if (arg == "--host" && i + 1 < argc) {
             args.host = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
@@ -73,7 +77,7 @@ cmdline_args parse_args(int argc, char ** argv) {
     return args;
 }
 
-std::unique_ptr<dspark_engine> make_engine(llama_model * model, const cmdline_args & args) {
+std::unique_ptr<dspark_engine> make_engine(llama_model * model, llama_context * ctx_target, const cmdline_args & args) {
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = args.n_ctx;
     ctx_params.n_threads = args.n_threads;
@@ -81,6 +85,8 @@ std::unique_ptr<dspark_engine> make_engine(llama_model * model, const cmdline_ar
     // DSpark uses non-causal attention; keep flash attention disabled to
     // avoid surprises with the dual-mode decoder graph.
     ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    // DFlash shares token embeddings and output head with the target model.
+    ctx_params.ctx_other = ctx_target;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (!ctx) {
@@ -114,15 +120,39 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    llama_model * model_tgt = nullptr;
+    llama_context * ctx_tgt = nullptr;
+    if (!args.target_model_path.empty()) {
+        model_tgt = llama_model_load_from_file(args.target_model_path.c_str(), model_params);
+        if (!model_tgt) {
+            LOG_ERR("[main] failed to load target model: %s\n", args.target_model_path.c_str());
+            llama_model_free(model);
+            return 1;
+        }
+        llama_context_params tgt_ctx_params = llama_context_default_params();
+        tgt_ctx_params.n_ctx = args.n_ctx;
+        tgt_ctx_params.n_threads = args.n_threads;
+        tgt_ctx_params.n_threads_batch = args.n_threads;
+        ctx_tgt = llama_init_from_model(model_tgt, tgt_ctx_params);
+        if (!ctx_tgt) {
+            LOG_ERR("[main] failed to create target context\n");
+            llama_model_free(model_tgt);
+            llama_model_free(model);
+            return 1;
+        }
+    }
+
     // Replay mode: create a single engine, replay golden traces, and exit.
     if (!args.replay_dir.empty()) {
-        auto engine = make_engine(model, args);
+        auto engine = make_engine(model, ctx_tgt, args);
         if (!engine || !engine->init()) {
             LOG_ERR("[main] failed to initialize DSpark engine\n");
             llama_model_free(model);
             return 1;
         }
         int rc = replay_golden(*engine, args.replay_dir);
+        llama_free(ctx_tgt);
+        llama_model_free(model_tgt);
         llama_model_free(model);
         return rc;
     }
@@ -136,7 +166,7 @@ int main(int argc, char ** argv) {
     // Factory creates a new engine per session. For now we share the same
     // model; each session gets its own context.
     dspark_engine_factory factory = [&]() {
-        return make_engine(model, args);
+        return make_engine(model, ctx_tgt, args);
     };
 
     dspark_service_impl service(factory, renderer);
@@ -151,6 +181,8 @@ int main(int argc, char ** argv) {
 
     server->Wait();
 
+    llama_free(ctx_tgt);
+    llama_model_free(model_tgt);
     llama_model_free(model);
     llama_backend_free();
     return 0;

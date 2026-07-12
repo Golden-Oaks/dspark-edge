@@ -30,9 +30,17 @@ This repository now contains the Linux implementation described in `handoff.md`.
 - `llama-dspark-grpcd --help` runs.
 - `tests/test_proto.py` passes.
 
+## Milestones (handoff.md §17)
+
+All Phase-1 Linux milestones (1–8) are implemented and verified end-to-end.
+See `HANDOFF.md` for status, evidence, and the Milestone-6 root-cause writeup.
+
+- M1 local baseline ✅  M2 daemon skeleton ✅  M3 golden dump ✅  M4 replay (100% parity) ✅
+- M5 fake drafter ✅  M6 real remote drafter (acceptance ≈0.31–0.44, greedy-identical) ✅
+- M7 `--watch` preview ✅  M8 `/debug/spec` + graceful fallback ✅
+
 ## Next steps (not in this phase)
 
-- Milestone 1: convert Qwen3-4B + DSpark checkpoint and run local `draft-dspark`.
-- Milestone 3: instrument local path to dump golden feature packets.
-- Milestone 6: end-to-end localhost/Pi run with real models.
-- Phase 2: QNX port.
+- Phase 2: QNX port of the edge daemon.
+- q8 feature transport; temp>0 lossless sampling; multi-sequence batching.
+- Live daemon reconnect (server currently handshakes once at startup).

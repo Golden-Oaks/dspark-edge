@@ -28,6 +28,7 @@ struct draft_request {
     uint64_t position;                 // truncate draft KV beyond this first
     int32_t  max_draft_tokens;
     bool     greedy;
+    int32_t  anchor_token = 0;         // id_last: token the draft block anchors on
     std::vector<token_features> accepted_tokens;
 };
 
@@ -113,6 +114,14 @@ private:
 
     // Anchor token for the next draft block (last token accepted into KV).
     llama_token last_token_id_ = 0;
+
+    // Highest position of a *confirmed* token injected into the draft KV cache
+    // (prompt prefill + accepted tokens). The speculative noise block decoded by
+    // run_draft() writes transient KV cells beyond this position; they are removed
+    // at the start of the next draft() before new accepted tokens are injected.
+    // -1 means the cache is empty. Tracked internally so the daemon never depends
+    // on the server's (possibly stale) request position for KV truncation.
+    llama_pos kv_confirmed_max_ = -1;
 };
 
 // Factory that creates an engine for a new session.

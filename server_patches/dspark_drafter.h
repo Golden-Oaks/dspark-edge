@@ -20,6 +20,7 @@ struct remote_dspark_request {
     uint64_t position;             // truncate draft KV beyond this first
     int32_t  max_draft_tokens;
     bool     greedy;
+    int32_t  anchor_token = 0;     // id_last: token the draft block anchors on
     std::vector<dspark_token_features> accepted_tokens;
 };
 

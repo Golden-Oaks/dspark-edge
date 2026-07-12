@@ -3,12 +3,18 @@
 // Remote DSpark speculative implementation.
 // This file is intended to be inserted into common/speculative.cpp.
 
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "dspark_drafter.h"
+#include "dspark_stats.h"
+#include "log.h"
 
 // Server-side remote DSpark drafter.
 // This file is included into common/speculative.cpp after the base class and
@@ -30,15 +36,19 @@ struct common_speculative_impl_draft_remote_dspark : public common_speculative_i
     // Target context and model.
     llama_context * ctx_tgt = nullptr;
 
-    // Buffers for features extracted from the target context.
-    std::vector<dspark_token_features> prefill_buf;
-    std::vector<dspark_token_features> accepted_buf;
+    // Every token the target has decoded, keyed by its sequence position. The
+    // remote drafter needs the target hidden states of the *committed* prefix
+    // (positions 0 .. n_past-1) in its local draft KV cache. process() captures
+    // features per decoded position here; draft() ships the not-yet-sent ones.
+    // Rejected-draft positions are simply never shipped (they get overwritten by
+    // the next batch that re-decodes those positions).
+    std::map<uint64_t, dspark_token_features> feats;
 
     // State machine.
-    bool in_prefill = true;
-    bool prefill_sent = false;
-    uint64_t last_position = 0; // last confirmed position sent to edge
-    uint64_t step_id = 0;
+    bool     prefilled = false;  // has the prompt prefill been shipped yet
+    int64_t  n_sent   = -1;      // highest position already injected into the edge
+    int64_t  prev_n_past = -1;   // committed count at the previous draft (for acceptance stats)
+    uint64_t step_id  = 0;
 
     // Scratch buffer for concatenated float features [n_tokens, n_embd_enc].
     std::vector<float> features_buf;
@@ -48,6 +58,8 @@ struct common_speculative_impl_draft_remote_dspark : public common_speculative_i
         , params(params.draft)
         , ctx_tgt(params.draft.ctx_tgt) {
         GGML_ASSERT(ctx_tgt && "draft-remote-dspark requires ctx_tgt");
+        LOG_ERR("[remote-dspark] ctx_tgt=%p remote_grpc='%s'\n",
+                (void*)ctx_tgt, params.draft.remote_grpc.c_str());
 
         drafter = std::make_unique<grpc_dspark_drafter>(params.draft.remote_grpc);
 
@@ -67,6 +79,13 @@ struct common_speculative_impl_draft_remote_dspark : public common_speculative_i
             return;
         }
 
+        // Publish connection state for the /debug/spec endpoint.
+        {
+            auto & st = remote_dspark_stats_get();
+            st.connected = true;
+            st.edge_host = params.draft.remote_grpc;
+        }
+
         // Enable extraction of the tap layers' input embeddings.
         for (int32_t lid : target_layer_ids) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t)lid, true);
@@ -81,13 +100,27 @@ struct common_speculative_impl_draft_remote_dspark : public common_speculative_i
 
     ~common_speculative_impl_draft_remote_dspark() override = default;
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        in_prefill = true;
-        prefill_sent = false;
-        prefill_buf.clear();
-        accepted_buf.clear();
-        last_position = 0;
-        step_id = 0;
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & prompt) override {
+        // A new generation begins. process() has already captured this prompt's
+        // features into `feats` at positions 0 .. N-1 (it runs before begin()).
+        // Reset our send bookkeeping and the edge session, but keep those prompt
+        // features so draft() can ship them as the prefill.
+        prefilled = false;
+        n_sent    = -1;
+        prev_n_past = -1;
+        step_id   = 0;
+
+        // Drop any stale features left over from a previous, longer generation
+        // that would otherwise sit past the new prompt.
+        const uint64_t n_prompt = (uint64_t)prompt.size();
+        for (auto it = feats.begin(); it != feats.end(); ) {
+            if (it->first >= n_prompt) {
+                it = feats.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
         if (drafter) {
             drafter->reset();
         }
@@ -119,22 +152,22 @@ struct common_speculative_impl_draft_remote_dspark : public common_speculative_i
             }
         }
 
-        auto & buf = in_prefill ? prefill_buf : accepted_buf;
+        // Store one feature packet per decoded position, keyed by position so a
+        // re-decoded position overwrites its stale value.
+        const size_t n_values = (size_t)target_layer_ids.size() * (size_t)hidden_size;
         for (int32_t i = 0; i < n_tokens; ++i) {
             dspark_token_features tf;
             tf.token = batch_in.token[i];
             tf.position = (uint64_t)batch_in.pos[i];
-            // Pack as bf16.
-            const size_t n_values = (size_t)target_layer_ids.size() * (size_t)hidden_size;
             tf.features.resize(n_values * sizeof(uint16_t));
             for (size_t v = 0; v < n_values; ++v) {
                 float f = features_buf[(size_t)i * n_values + v];
                 uint32_t u32;
                 std::memcpy(&u32, &f, sizeof(uint32_t));
-                uint16_t u16 = (uint16_t)(u32 >> 16);
+                uint16_t u16 = (uint16_t)(u32 >> 16); // truncate f32 -> bf16
                 std::memcpy(tf.features.data() + v * sizeof(uint16_t), &u16, sizeof(uint16_t));
             }
-            buf.push_back(std::move(tf));
+            feats[tf.position] = std::move(tf);
         }
 
         return true;
@@ -145,50 +178,98 @@ struct common_speculative_impl_draft_remote_dspark : public common_speculative_i
             return;
         }
 
-        if (in_prefill) {
-            // Send the prompt features in one or more Prefill calls.
-            // For the POC, send all at once.
-            drafter->prefill(prefill_buf, /*last_chunk*/ true);
-            if (!prefill_buf.empty()) {
-                last_position = prefill_buf.back().position;
+        // POC is single-sequence: draft for the first sequence that wants one.
+        common_speculative_draft_params * dp = nullptr;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id)n_seq; ++seq_id) {
+            if (dparams[seq_id].drafting) {
+                dp = &dparams[seq_id];
+                break;
             }
-            prefill_buf.clear();
-            in_prefill = false;
-            prefill_sent = true;
+        }
+        if (!dp) {
+            return;
+        }
+
+        // Committed prefix is positions 0 .. n_past-1. The edge must hold their
+        // features before it can draft. The anchor token (id_last) is the token
+        // to draft from; its own hidden state is not needed (the draft graph uses
+        // its token embedding), so it is sent by id only.
+        const int64_t n_past = (int64_t)dp->n_past;
+
+        // Acceptance accounting: since the previous draft, the server committed
+        // (n_past - prev_n_past) tokens, of which one is the freshly sampled token
+        // and the rest are accepted draft tokens.
+        auto & stats = remote_dspark_stats_get();
+        if (prev_n_past >= 0) {
+            const int64_t accepted = n_past - prev_n_past - 1;
+            if (accepted > 0) {
+                stats.accepted_tokens += (uint64_t)accepted;
+            }
+        }
+        prev_n_past = n_past;
+
+        auto gather = [&](int64_t lo, int64_t hi, std::vector<dspark_token_features> & out) -> bool {
+            for (int64_t pos = lo; pos <= hi; ++pos) {
+                auto it = feats.find((uint64_t)pos);
+                if (it == feats.end()) {
+                    LOG_ERR("%s: missing target features for committed position %lld\n",
+                            __func__, (long long)pos);
+                    return false;
+                }
+                out.push_back(it->second);
+            }
+            return true;
+        };
+
+        if (!prefilled) {
+            std::vector<dspark_token_features> prefill;
+            if (!gather(0, n_past - 1, prefill)) {
+                return;
+            }
+            drafter->prefill(prefill, /*last_chunk*/ true);
+            prefilled = true;
+            n_sent = n_past - 1;
         }
 
         remote_dspark_request req;
         req.session_id = 0; // not used by grpc client
         req.step_id    = ++step_id;
-        req.position   = last_position;
+        req.position   = (uint64_t)(n_sent < 0 ? 0 : n_sent);
         req.max_draft_tokens = std::min(params.n_max, block_size);
         req.greedy     = true;
-        req.accepted_tokens = std::move(accepted_buf);
+        req.anchor_token = dp->id_last;
+        if (!gather(n_sent + 1, n_past - 1, req.accepted_tokens)) {
+            return;
+        }
+        n_sent = n_past - 1;
 
+        const auto t_grpc0 = std::chrono::steady_clock::now();
         remote_dspark_response res = drafter->draft(req);
+        const auto t_grpc1 = std::chrono::steady_clock::now();
+        stats.grpc_us_sum += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t_grpc1 - t_grpc0).count();
+        stats.grpc_calls++;
+
         if (!res.ok) {
+            // Edge unreachable or draft failed: record a fallback step and let the
+            // server decode this token with the target model only (§16).
+            stats.fallback_steps++;
+            stats.connected = false;
             LOG_ERR("%s: remote draft failed: %s\n", __func__, res.error.c_str());
             return;
         }
 
-        // Update last_position to the most recent accepted token.
-        if (!req.accepted_tokens.empty()) {
-            last_position = req.accepted_tokens.back().position;
-        }
+        stats.connected      = true;
+        stats.draft_blocks++;
+        stats.draft_tokens  += (uint64_t)res.draft_tokens.size();
+        stats.edge_draft_us_sum += (uint64_t)res.draft_us;
 
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id)n_seq; ++seq_id) {
-            auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
-                continue;
-            }
-            for (int32_t tok : res.draft_tokens) {
-                dp.result->push_back((llama_token)tok);
-            }
+        for (int32_t tok : res.draft_tokens) {
+            dp->result->push_back((llama_token)tok);
         }
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+        // noop: acceptance is inferred from dp->n_past on the next draft()
     }
 
     bool need_embd() const override {

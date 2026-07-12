@@ -83,6 +83,12 @@ message DraftRequest {
 
   uint32 max_draft_tokens = 5;
   bool greedy = 6; // POC assumes greedy; non-greedy deferred
+
+  // The anchor token the drafter builds its block from: [anchor, <mask> ...].
+  // This is the server's id_last (the just-sampled token to draft from). Its
+  // target hidden state is not yet available (it has not been decoded), so it
+  // is carried by id only, separate from accepted_tokens (which carry features).
+  int32 anchor_token = 7;
 }
 
 message DraftResponse {

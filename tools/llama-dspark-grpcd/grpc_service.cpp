@@ -134,20 +134,10 @@ grpc::Status dspark_service_impl::Draft(
     req.position   = request->position();
     req.max_draft_tokens = request->max_draft_tokens();
     req.greedy     = request->greedy();
+    req.anchor_token = request->anchor_token();
     req.accepted_tokens = unpack_tokens(request->accepted_tokens());
 
-    auto t0 = std::chrono::steady_clock::now();
     draft_response res = s->engine->draft(req);
-    if (renderer_) {
-        // Verdict first: settle the previous pending region with accepted tokens.
-        std::vector<int32_t> accepted;
-        accepted.reserve(req.accepted_tokens.size());
-        for (const auto & tf : req.accepted_tokens) accepted.push_back(tf.token);
-        renderer_->on_verdict(accepted);
-        // Then show the new pending draft.
-        renderer_->on_draft(res.draft_tokens);
-    }
-    auto t1 = std::chrono::steady_clock::now();
 
     response->set_session_id(res.session_id);
     response->set_step_id(res.step_id);
@@ -165,7 +155,17 @@ grpc::Status dspark_service_impl::Draft(
         response->add_confidence(c);
     }
 
-    (void)t0; (void)t1; // latency already measured in engine
+    // Notify the (asynchronous) preview renderer last. on_verdict/on_draft only
+    // enqueue events, so this never delays the response the server is waiting on.
+    if (renderer_) {
+        // Verdict first: settle the previous pending region with accepted tokens.
+        std::vector<int32_t> accepted;
+        accepted.reserve(req.accepted_tokens.size());
+        for (const auto & tf : req.accepted_tokens) accepted.push_back(tf.token);
+        renderer_->on_verdict(accepted);
+        // Then show the new pending draft.
+        renderer_->on_draft(res.draft_tokens);
+    }
 
     return grpc::Status::OK;
 }
@@ -186,7 +186,6 @@ grpc::Status dspark_service_impl::Reset(
         std::lock_guard<std::mutex> slock(it->second->mtx);
         it->second->engine->reset();
     }
-    sessions_.erase(it);
     if (renderer_) renderer_->on_reset();
 
     response->set_ok(true);

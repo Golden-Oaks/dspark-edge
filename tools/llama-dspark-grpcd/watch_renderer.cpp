@@ -10,6 +10,64 @@
 namespace dspark {
 
 watch_renderer::watch_renderer(const llama_model * model) : model_(model) {
+    worker_ = std::thread(&watch_renderer::worker_loop, this);
+}
+
+watch_renderer::~watch_renderer() {
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) {
+        worker_.join();
+    }
+}
+
+void watch_renderer::enqueue(event ev) {
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        queue_.push_back(std::move(ev));
+    }
+    cv_.notify_one();
+}
+
+void watch_renderer::on_accepted(const std::vector<int32_t> & tokens) {
+    if (tokens.empty()) return;
+    enqueue({ev_type::accepted, tokens});
+}
+
+void watch_renderer::on_draft(const std::vector<int32_t> & tokens) {
+    enqueue({ev_type::draft, tokens});
+}
+
+void watch_renderer::on_verdict(const std::vector<int32_t> & accepted) {
+    enqueue({ev_type::verdict, accepted});
+}
+
+void watch_renderer::on_reset() {
+    enqueue({ev_type::reset, {}});
+}
+
+void watch_renderer::worker_loop() {
+    for (;;) {
+        event ev;
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+            if (stop_ && queue_.empty()) {
+                return;
+            }
+            ev = std::move(queue_.front());
+            queue_.pop_front();
+        }
+        switch (ev.type) {
+            case ev_type::accepted: handle_accepted(ev.tokens); break;
+            case ev_type::draft:    handle_draft(ev.tokens);    break;
+            case ev_type::verdict:  handle_verdict(ev.tokens);  break;
+            case ev_type::reset:    handle_reset();             break;
+        }
+    }
 }
 
 std::string watch_renderer::detokenize(const std::vector<int32_t> & tokens) const {
@@ -41,9 +99,8 @@ void watch_renderer::emit_region(const region & r) const {
     }
 }
 
-void watch_renderer::on_accepted(const std::vector<int32_t> & tokens) {
+void watch_renderer::handle_accepted(const std::vector<int32_t> & tokens) {
     if (tokens.empty()) return;
-    std::lock_guard<std::mutex> lock(mtx_);
     region r;
     r.text = detokenize(tokens);
     r.st   = region::confirmed;
@@ -51,9 +108,8 @@ void watch_renderer::on_accepted(const std::vector<int32_t> & tokens) {
     redraw();
 }
 
-void watch_renderer::on_draft(const std::vector<int32_t> & tokens) {
+void watch_renderer::handle_draft(const std::vector<int32_t> & tokens) {
     if (tokens.empty()) return;
-    std::lock_guard<std::mutex> lock(mtx_);
     pending_tokens_ = tokens;
     region r;
     r.text = detokenize(tokens);
@@ -62,8 +118,7 @@ void watch_renderer::on_draft(const std::vector<int32_t> & tokens) {
     redraw();
 }
 
-void watch_renderer::on_verdict(const std::vector<int32_t> & accepted) {
-    std::lock_guard<std::mutex> lock(mtx_);
+void watch_renderer::handle_verdict(const std::vector<int32_t> & accepted) {
     if (pending_tokens_.empty()) {
         // No pending region; just append accepted tokens as confirmed.
         if (!accepted.empty()) {
@@ -97,7 +152,7 @@ void watch_renderer::on_verdict(const std::vector<int32_t> & accepted) {
         transcript_.push_back(std::move(r));
     }
 
-    // First rejected token -> brief strikethrough flash.
+    // First rejected token -> strikethrough flash.
     if (match < pending_tokens_.size()) {
         std::vector<int32_t> rejected(1, pending_tokens_[match]);
         region r;
@@ -106,7 +161,7 @@ void watch_renderer::on_verdict(const std::vector<int32_t> & accepted) {
         transcript_.push_back(std::move(r));
     }
 
-    // Server correction / remaining accepted tokens -> normal text with highlight.
+    // Server correction / remaining accepted tokens -> normal text.
     if (match < accepted.size()) {
         std::vector<int32_t> corr(accepted.begin() + match, accepted.end());
         region r;
@@ -119,14 +174,15 @@ void watch_renderer::on_verdict(const std::vector<int32_t> & accepted) {
     redraw();
 }
 
-void watch_renderer::on_reset() {
-    std::lock_guard<std::mutex> lock(mtx_);
+void watch_renderer::handle_reset() {
     pending_tokens_.clear();
     transcript_.clear();
-    redraw();
+    // Print a newline to seal off the finished transcript before the next one.
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
 }
 
-void watch_renderer::redraw() {
+void watch_renderer::redraw() const {
     emit_clear();
     const size_t start = transcript_.size() > max_tail_regions
                              ? transcript_.size() - max_tail_regions
