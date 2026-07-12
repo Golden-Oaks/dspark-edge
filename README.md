@@ -55,6 +55,22 @@ omits the token-embedding matrix and output head to stay small (~630 MB), the
 daemon also loads the Qwen3-4B target GGUF purely to borrow those two shared
 tensors (`--target-model`).
 
+### Live demo — companion CLI drafting on the Pi
+
+Captured over SSH from the QNX Raspberry Pi 5 in real time: the edge daemon's
+`--watch` companion preview rendering live speculative decoding while this
+machine (x86-64 Linux) serves the Qwen3-4B target over gRPC. The ~80 s model
+load is fast-forwarded 10× (marked on screen); the drafting is real-time.
+
+[![DSpark companion CLI drafting live on the QNX Raspberry Pi 5](docs/media/dspark-pi-companion-cli.png)](docs/media/dspark-pi-companion-cli.mp4)
+
+In the `--watch` transcript, **gray italic** is the block the Pi just drafted
+(pending), **red strikethrough** is a draft token the target rejected, and plain
+text is confirmed output. The prompt `"The capital of France is"` streams
+token-by-token — each block drafted on-device, verified on the host — while the
+interleaved `[dspark-engine] inject_decode` lines are the daemon's real per-block
+draft calls. (Video: [`docs/media/dspark-pi-companion-cli.mp4`](docs/media/dspark-pi-companion-cli.mp4).)
+
 Build natively on the target:
 
 ```sh
